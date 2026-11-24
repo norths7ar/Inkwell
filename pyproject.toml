@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "inkwell"
+version = "0.1.0"
+description = "Personal local AI novel-writing workbench"
+readme = "README.md"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    "cryptography>=44.0.0",
+    "pydantic>=2.11.0",
+]
+
+[dependency-groups]
+dev = [
+    "pyright==1.1.414",
+    "ruff==0.17.5",
+]
+
+[tool.uv]
+required-version = ">=0.13.8"
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend"]
+
+[tool.pyright]
+include = ["backend"]
+typeCheckingMode = "standard"
+pythonVersion = "3.14"
+pythonPlatform = "Windows"
+exclude = ["**/node_modules", "**/__pycache__", "**/.*"]
+venvPath = "."
+venv = ".venv"
