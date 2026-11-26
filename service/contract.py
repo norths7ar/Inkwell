@@ -8,6 +8,17 @@ from pydantic import BaseModel, ConfigDict, Field
 type ServiceState = Literal["running", "stopped", "warning", "unknown"]
 
 
+class HealthResponse(BaseModel):
+    model_config = ConfigDict(strict=True)
+
+    schema_version: Literal[1]
+    ok: bool
+    service: Literal["inkwell"]
+    pid: int = Field(gt=0)
+    port: int = Field(ge=1, le=65535)
+    detail: str
+
+
 @dataclass(frozen=True)
 class Status:
     state: ServiceState

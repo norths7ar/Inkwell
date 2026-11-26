@@ -8,7 +8,7 @@ import psutil
 from pydantic import ValidationError
 
 from .config import Instance, same_path
-from .contract import ManagerError, RuntimeRecord, Status
+from .contract import HealthResponse, ManagerError, RuntimeRecord, Status
 from .platform import LockBusy, management_lock
 
 
@@ -82,15 +82,16 @@ class Runtime:
                 result.add(connection.pid)
         return result
 
-    def healthy(self) -> bool:
+    def healthy(self, expected_pid: int | None = None) -> bool:
         try:
             with httpx.Client(trust_env=False, timeout=2) as client:
                 response = client.get(self.instance.health_url)
-                value: object = response.json()
+                value = HealthResponse.model_validate_json(response.content)
                 return (
-                    response.is_success
-                    and isinstance(value, dict)
-                    and value.get("status") == "healthy"
+                    response.status_code == 200
+                    and value.ok
+                    and value.port == self.instance.port
+                    and (expected_pid is None or value.pid == expected_pid)
                 )
         except httpx.HTTPError, ValueError:
             return False
@@ -124,7 +125,7 @@ class Runtime:
                 raise
             return Status(error.state, str(error))
         listeners = self.listeners()
-        if process and process.pid in listeners and self.healthy():
+        if process and process.pid in listeners and self.healthy(process.pid):
             return Status(
                 "running", "Process identity, listening port and health check passed.", process.pid
             )

@@ -45,13 +45,17 @@ def create_app(
     shutdown: Callable[[], None] | None = None,
 ) -> FastAPI:
     runtime = ApiRuntime(config or load_config(), llm or LLMClient(), events or EventBus())
+    ready = False
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        nonlocal ready
         runtime.open()
+        ready = True
         try:
             yield
         finally:
+            ready = False
             await runtime.close()
 
     app = FastAPI(title="Inkwell", version="0.1.0", lifespan=lifespan)
@@ -79,13 +83,26 @@ def create_app(
     app.add_exception_handler(LLMError, upstream)
 
     @app.get("/health")
-    async def health() -> dict[str, str]:
-        return {"status": "healthy", "service": "inkwell"}
+    async def health() -> JSONResponse:
+        return JSONResponse(
+            {
+                "schema_version": 1,
+                "ok": ready,
+                "service": "inkwell",
+                "pid": os.getpid(),
+                "port": runtime.config.port,
+                "detail": "运行中" if ready else "服务尚未就绪或正在关闭",
+                "status": "healthy" if ready else "unavailable",
+            },
+            status_code=200 if ready else 503,
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.post("/health/shutdown", include_in_schema=False)
     async def request_shutdown(
         x_inkwell_shutdown_token: str = Header(default=""),
     ) -> dict[str, str]:
+        nonlocal ready
         token = os.getenv("INKWELL_SHUTDOWN_TOKEN", "")
         if (
             shutdown is None
@@ -93,6 +110,7 @@ def create_app(
             or not hmac.compare_digest(token, x_inkwell_shutdown_token)
         ):
             raise HTTPException(403, "Forbidden")
+        ready = False
         runtime.events.close()
         shutdown()
         return {"status": "stopping"}

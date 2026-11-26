@@ -67,7 +67,7 @@ class Lifecycle:
                 if launcher.poll() is not None:
                     raise ManagerError(f"Inkwell exited during startup. See {stderr}")
                 listeners = self.runtime.listeners()
-                if len(listeners) == 1 and self.runtime.healthy():
+                if len(listeners) == 1 and self.runtime.healthy(next(iter(listeners))):
                     listener = psutil.Process(next(iter(listeners)))
                     if listener.pid != identity.pid and listener.ppid() != identity.pid:
                         raise ManagerError("Port was claimed by an unrelated process.", "warning")

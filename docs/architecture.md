@@ -84,6 +84,8 @@ uv run python -m service stop --json
 
 `status` 输出规范化 JSON；运行状态文件写入数据目录的 `runtime/`，日志写入 `logs/`；`stop` 会校验进程身份后再请求优雅退出，不会误杀同端口的其他未知进程。
 
+`GET /health` 遵循 Service Desk 版本 1 契约：返回 `schema_version: 1`、`ok`、`service: "inkwell"`、当前进程 `pid`、配置的 `port` 和 `detail`，并保留旧的 `status` 字段。就绪时返回 200，未就绪或正在关闭时返回 503；响应设置 `Cache-Control: no-store`，探针不访问磁盘、数据库或模型提供商。管理器同时核验服务标识、端口和监听进程 PID。Service Desk 的 Inkwell 卡片可配置 `health_url: "http://127.0.0.1:18082/health"`；`url` 仍为 `http://127.0.0.1:18082`。`status` 无需 `--json` 即输出版本 1 JSON；启停与重启使用 `--json`，成功结果包含匹配的 `action`、`ok: true` 和预期最终 `state`。
+
 ### 独立发布预留护栏
 
 为保证项目可平滑打包为单容器或桌面端应用（如 Tauri sidecar / `pywebview`），编码持续遵守以下边界：
