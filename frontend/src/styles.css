@@ -439,11 +439,12 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .book-card-desc {
+  .book-card-stats {
     margin-top: 4px;
     font-size: 12px;
     line-height: 1.5;
     color: #71717a;
+    font-variant-numeric: tabular-nums;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -459,13 +460,32 @@
   .book-card-date {
     font-size: 12px;
     color: #a1a1aa;
+    white-space: nowrap;
   }
-  .book-card-menu {
-    opacity: 0.7;
+  .book-card-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    flex-shrink: 0;
+    opacity: 0.72;
     transition: opacity 160ms ease;
   }
-  .book-card-surface:hover .book-card-menu,
-  .book-card-surface:focus-within .book-card-menu {
+  .book-card-action {
+    width: 28px;
+    height: 28px;
+    min-height: 28px;
+    padding: 0;
+    color: #52525b;
+  }
+  .book-card-action-danger {
+    color: #dc2626;
+  }
+  .book-card-action-danger:hover {
+    background: #fef2f2;
+    color: #b91c1c;
+  }
+  .book-card-surface:hover .book-card-actions,
+  .book-card-surface:focus-within .book-card-actions {
     opacity: 1;
   }
   .editor-panel {
@@ -475,8 +495,16 @@
     @apply flex shrink-0 items-center justify-between gap-2 border-b border-zinc-100 px-4 py-3;
     min-height: 54px;
   }
+  .editor-info {
+    min-width: 0;
+    overflow: hidden;
+    flex-wrap: nowrap;
+    white-space: nowrap;
+  }
   .editor-meta {
     @apply inline-flex items-center gap-2 text-xs text-zinc-500;
+    white-space: nowrap;
+    flex-shrink: 0;
   }
   .editor-meta-sep {
     @apply text-zinc-300;
@@ -490,6 +518,10 @@
     min-height: 30px;
     padding: 0;
     color: #52525b;
+  }
+  .editor-actions .icon-control.is-active {
+    background: #e4e5ea;
+    color: #18181b;
   }
   .editor-save-icon.is-dirty {
     background: #18181b;
@@ -507,6 +539,8 @@
   }
   .save-status {
     @apply inline-flex items-center gap-1.5 text-xs text-zinc-500;
+    white-space: nowrap;
+    flex-shrink: 0;
   }
   .save-dot {
     width: 6px;
@@ -521,7 +555,8 @@
     color: #b45309;
   }
   .editor-page {
-    @apply mx-auto flex min-h-0 w-full max-w-[760px] flex-1 flex-col gap-5 px-10 pb-5 pt-8;
+    @apply mx-auto flex min-h-0 w-full flex-1 flex-col gap-5 px-10 pb-5 pt-8;
+    max-width: var(--editor-max-width, 760px);
   }
   .editor-page > .field:first-child input,
   .editor-page > .field:first-child input:focus,
@@ -546,12 +581,97 @@
   .manuscript textarea,
   .manuscript textarea:focus,
   .manuscript textarea:focus-visible {
-    @apply min-h-0 flex-1 resize-none rounded-none border-0 bg-transparent px-0 py-2 text-base;
+    @apply min-h-0 flex-1 resize-none rounded-none border-0 bg-transparent px-0 py-2;
     border: 0;
     outline: none;
     box-shadow: none;
-    line-height: 2.1;
-    font-family: Georgia, "Noto Serif SC", "Microsoft YaHei", serif;
+    font-size: var(--editor-font-size, 16px);
+    line-height: var(--editor-line-height, 2.1);
+    font-family: var(--editor-font-family, Georgia, "Noto Serif SC", "Microsoft YaHei", serif);
+  }
+  .editor-preview-title {
+    margin: 0;
+    padding-bottom: 16px;
+    border-bottom: 1px solid #f4f4f5;
+    font-size: 24px;
+    font-weight: 500;
+    line-height: 1.35;
+    color: #18181b;
+  }
+  .editor-preview-scroll {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 8px 0 16px;
+  }
+  .editor-markdown {
+    font-size: var(--editor-font-size, 16px);
+    line-height: var(--editor-line-height, 2.1);
+    font-family: var(--editor-font-family, Georgia, "Noto Serif SC", "Microsoft YaHei", serif);
+    color: #27272a;
+  }
+  .editor-markdown > *:first-child {
+    margin-top: 0;
+  }
+  .editor-markdown p {
+    margin: 0 0 1.1em;
+  }
+  .editor-markdown h1,
+  .editor-markdown h2,
+  .editor-markdown h3,
+  .editor-markdown h4 {
+    margin: 1.4em 0 0.6em;
+    font-weight: 600;
+    color: #18181b;
+  }
+  .editor-markdown h1 {
+    font-size: 1.5em;
+  }
+  .editor-markdown h2 {
+    font-size: 1.25em;
+  }
+  .editor-markdown h3 {
+    font-size: 1.1em;
+  }
+  .editor-markdown ul,
+  .editor-markdown ol {
+    margin: 0 0 1.1em;
+    padding-left: 1.5em;
+  }
+  .editor-markdown ul {
+    list-style: disc;
+  }
+  .editor-markdown ol {
+    list-style: decimal;
+  }
+  .editor-markdown blockquote {
+    margin: 0 0 1.1em;
+    padding: 4px 14px;
+    border-left: 3px solid #d4d4d8;
+    color: #52525b;
+  }
+  .editor-markdown hr {
+    margin: 1.5em 0;
+    border: 0;
+    border-top: 1px solid #e4e4e7;
+  }
+  .editor-markdown code {
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: #f4f4f5;
+    font-size: 0.9em;
+  }
+  .editor-markdown pre {
+    margin: 0 0 1.1em;
+    padding: 12px 14px;
+    border-radius: 8px;
+    background: #fafafa;
+    border: 1px solid #e4e4e7;
+    overflow-x: auto;
+  }
+  .editor-markdown pre code {
+    padding: 0;
+    background: transparent;
   }
   .editor-footer {
     @apply flex shrink-0 items-center justify-between gap-2 px-5 py-2 text-xs text-zinc-400;
@@ -634,11 +754,113 @@
   .diff-after {
     @apply bg-white;
   }
+  .diff-line-changed-old {
+    background: rgba(254, 226, 226, 0.35);
+  }
+  .diff-line-changed-new {
+    background: rgba(209, 250, 229, 0.35);
+  }
   .diff-removed {
     @apply rounded bg-red-100/90 px-0.5 text-red-900;
   }
   .diff-added {
     @apply rounded bg-emerald-100/90 px-0.5 text-emerald-900;
+  }
+  .pending-batch-strip {
+    @apply flex items-center justify-between gap-3 border-b border-zinc-100 px-5 py-2.5 text-xs;
+  }
+  .revision-dialog {
+    width: min(920px, 92vw);
+  }
+  .revision-split {
+    display: grid;
+    grid-template-columns: 240px minmax(0, 1fr);
+    gap: 16px;
+    min-height: 420px;
+    max-height: 62vh;
+  }
+  .revision-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    overflow-y: auto;
+    padding-right: 4px;
+  }
+  .revision-item {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 10px 12px;
+    border: 1px solid #e4e4e7;
+    border-radius: 10px;
+    background: #fafafa;
+    text-align: left;
+    transition:
+      background-color 140ms ease,
+      border-color 140ms ease;
+  }
+  .revision-item:hover {
+    background: #f4f4f5;
+  }
+  .revision-item.is-selected {
+    background: #ffffff;
+    border-color: #18181b;
+  }
+  .revision-item-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    font-size: 11px;
+    color: #71717a;
+  }
+  .revision-item-title {
+    font-size: 13px;
+    font-weight: 500;
+    color: #18181b;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .revision-detail {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    min-width: 0;
+    min-height: 0;
+  }
+  .revision-diff-box {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    border: 1px solid #e4e4e7;
+    border-radius: 10px;
+    overflow: hidden;
+    background: #ffffff;
+  }
+  .revision-diff-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 14px;
+    border-bottom: 1px solid #f0f0f3;
+    background: #fafafa;
+    font-size: 13px;
+  }
+  .revision-diff-pre {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    margin: 0;
+    padding: 14px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font-family: inherit;
+    font-size: 13.5px;
+    line-height: 1.75;
+    color: #27272a;
   }
   .diff-grid > div {
     min-width: 0;
@@ -661,6 +883,38 @@
     min-height: 30px;
     flex: 0 0 30px;
     padding: 0;
+  }
+  .switch-control {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    width: 36px;
+    height: 20px;
+    flex-shrink: 0;
+    padding: 2px;
+    border: 0;
+    border-radius: 9999px;
+    background: #d4d4d8;
+    transition: background-color 150ms ease;
+  }
+  .switch-control.is-checked {
+    background: #18181b;
+  }
+  .switch-control:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+  .switch-thumb {
+    width: 16px;
+    height: 16px;
+    border-radius: 9999px;
+    background: #ffffff;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.16);
+    transform: translateX(0);
+    transition: transform 150ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  .switch-control.is-checked .switch-thumb {
+    transform: translateX(16px);
   }
   .menu-trigger {
     min-width: 0;

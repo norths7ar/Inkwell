@@ -1,5 +1,7 @@
 import {
   useId,
+  useRef,
+  useState,
   type ButtonHTMLAttributes,
   type InputHTMLAttributes,
   type ReactNode,
@@ -9,7 +11,7 @@ import {
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import * as SelectPrimitive from "@radix-ui/react-select";
 import * as MenuPrimitive from "@radix-ui/react-dropdown-menu";
-import { Check, ChevronDown, ChevronRight, MoreHorizontal, X } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, MoreHorizontal, Search, X } from "lucide-react";
 
 export function Button({
   variant = "secondary",
@@ -23,13 +25,14 @@ export function Button({
 export function Input({
   label,
   className = "",
+  ref,
   ...props
-}: InputHTMLAttributes<HTMLInputElement> & { label?: string }) {
+}: InputHTMLAttributes<HTMLInputElement> & { label?: string; ref?: Ref<HTMLInputElement> }) {
   const id = useId();
   return (
     <label className={`field ${className}`} htmlFor={id}>
       {label && <span>{label}</span>}
-      <input id={id} {...props} />
+      <input ref={ref} id={id} {...props} />
     </label>
   );
 }
@@ -106,6 +109,7 @@ export function Dialog({
   onOpenChange,
   children,
   wide = false,
+  hideHeader = false,
   className = "",
 }: {
   title: string;
@@ -114,6 +118,7 @@ export function Dialog({
   onOpenChange: (open: boolean) => void;
   children: ReactNode;
   wide?: boolean;
+  hideHeader?: boolean;
   className?: string;
 }) {
   const descriptionId = useId();
@@ -125,14 +130,18 @@ export function Dialog({
           className={`dialog ${wide ? "dialog-wide" : ""} ${className}`}
           aria-describedby={description ? descriptionId : undefined}
         >
-          <div className="dialog-heading">
-            <DialogPrimitive.Title>{title}</DialogPrimitive.Title>
-            <DialogPrimitive.Close asChild>
-              <Button variant="ghost" aria-label="关闭">
-                <X size={18} />
-              </Button>
-            </DialogPrimitive.Close>
-          </div>
+          {hideHeader ? (
+            <DialogPrimitive.Title className="sr-only">{title}</DialogPrimitive.Title>
+          ) : (
+            <div className="dialog-heading">
+              <DialogPrimitive.Title>{title}</DialogPrimitive.Title>
+              <DialogPrimitive.Close asChild>
+                <Button variant="ghost" aria-label="关闭">
+                  <X size={18} />
+                </Button>
+              </DialogPrimitive.Close>
+            </div>
+          )}
           {description && (
             <DialogPrimitive.Description id={descriptionId} className="muted">
               {description}
@@ -144,16 +153,43 @@ export function Dialog({
     </DialogPrimitive.Root>
   );
 }
+export function Switch({
+  checked,
+  onCheckedChange,
+  disabled = false,
+  label,
+}: {
+  checked: boolean;
+  onCheckedChange: (checked: boolean) => void;
+  disabled?: boolean;
+  label: string;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      aria-label={label}
+      disabled={disabled}
+      className={`switch-control ${checked ? "is-checked" : ""}`}
+      onClick={() => onCheckedChange(!checked)}
+    >
+      <span className="switch-thumb" aria-hidden="true" />
+    </button>
+  );
+}
 export function Menu({
   label,
   children,
   iconOnly = false,
+  icon,
   align = "end",
   triggerClassName = "",
 }: {
   label: string;
   children: ReactNode;
   iconOnly?: boolean;
+  icon?: ReactNode;
   align?: "start" | "center" | "end";
   triggerClassName?: string;
 }) {
@@ -167,7 +203,7 @@ export function Menu({
           title={iconOnly ? label : undefined}
         >
           {iconOnly ? (
-            <MoreHorizontal size={17} />
+            (icon ?? <MoreHorizontal size={17} />)
           ) : (
             <>
               <span>{label}</span>
@@ -262,4 +298,84 @@ export function Alert({ children }: { children: ReactNode }) {
       {children}
     </div>
   ) : null;
+}
+
+export function DirectoryToolbar({
+  searchValue,
+  onSearchChange,
+  searchLabel,
+  searchPlaceholder = "筛选…",
+  badge,
+  create,
+  more,
+}: {
+  searchValue: string;
+  onSearchChange: (value: string) => void;
+  searchLabel: string;
+  searchPlaceholder?: string;
+  badge?: ReactNode;
+  create?: ReactNode;
+  more?: ReactNode;
+}) {
+  const [focused, setFocused] = useState(false);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const expanded = focused || searchValue.length > 0;
+
+  return (
+    <div className={`directory-toolbar ${expanded ? "is-search-expanded" : ""}`}>
+      <div className={`directory-search-box ${expanded ? "is-expanded" : ""}`}>
+        <button
+          type="button"
+          className="directory-search-trigger"
+          aria-label={searchLabel}
+          title={searchLabel}
+          onClick={() => {
+            setFocused(true);
+            window.setTimeout(() => inputRef.current?.focus(), 0);
+          }}
+        >
+          <Search size={15} />
+        </button>
+        <input
+          ref={inputRef}
+          type="search"
+          className="directory-search-input"
+          aria-label={searchLabel}
+          placeholder={searchPlaceholder}
+          value={searchValue}
+          tabIndex={expanded ? 0 : -1}
+          onFocus={() => setFocused(true)}
+          onBlur={() => setFocused(false)}
+          onChange={(event) => onSearchChange(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Escape") {
+              if (searchValue) onSearchChange("");
+              else inputRef.current?.blur();
+            }
+          }}
+        />
+        {searchValue && (
+          <button
+            type="button"
+            className="directory-search-clear"
+            aria-label={`清除${searchLabel}`}
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={() => {
+              onSearchChange("");
+              inputRef.current?.focus();
+            }}
+          >
+            <X size={13} />
+          </button>
+        )}
+      </div>
+      {!expanded && (badge || create || more) && (
+        <div className="directory-toolbar-actions">
+          {badge}
+          {create}
+          {more}
+        </div>
+      )}
+    </div>
+  );
 }

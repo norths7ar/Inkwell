@@ -63,7 +63,8 @@ function InkwellApp() {
   useEvents((event) => {
     if (
       event.type === "resync_required" ||
-      (event.type === "content_changed" && event.resource === "book")
+      (event.type === "content_changed" &&
+        (event.resource === "book" || event.resource === "chapter"))
     )
       refreshBooks();
   });

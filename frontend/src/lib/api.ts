@@ -12,6 +12,10 @@ const failureSchema = z.object({
   detail: z
     .union([
       z.string(),
+      z.object({
+        message: z.string().optional(),
+        code: z.string().optional(),
+      }),
       z.array(z.object({ loc: z.array(z.union([z.string(), z.number()])), msg: z.string() })),
     ])
     .optional(),
@@ -29,7 +33,9 @@ async function parseResponse<T>(response: Response, schema: z.ZodType<T>): Promi
         ? error.message
         : typeof detail === "string"
           ? detail
-          : detail?.map((item) => `${item.loc.join(".")}：${item.msg}`).join("；") || message;
+          : Array.isArray(detail)
+            ? detail.map((item) => `${item.loc.join(".")}：${item.msg}`).join("；") || message
+            : detail?.message || message;
     }
     throw new ApiError(response.status, message);
   }
@@ -56,10 +62,11 @@ export async function upload<T>(
   schema: z.ZodType<T>,
   file: File,
   method = "PUT",
+  contentType?: string,
 ): Promise<T> {
   const response = await fetch(`/api${path}`, {
     method,
-    headers: { "Content-Type": file.type || "application/octet-stream" },
+    headers: { "Content-Type": contentType || file.type || "application/octet-stream" },
     body: file,
   });
   return parseResponse(response, schema);

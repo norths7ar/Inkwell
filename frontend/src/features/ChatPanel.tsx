@@ -3,21 +3,32 @@ import { createPortal } from "react-dom";
 import {
   AlertCircle,
   ArrowUp,
+  AtSign,
   BookOpen,
   Brain,
   Check,
   ChevronRight,
+  Copy,
+  Gauge,
+  GitBranch,
   Globe,
   Lightbulb,
   Loader2,
   Lock,
+  Minimize2,
+  NotebookPen,
   Pencil,
   PenLine,
+  Pin,
+  PinOff,
+  Plus,
+  RotateCcw,
   SearchCheck,
   Sparkles,
   Square,
   SquarePen,
   Trash2,
+  X,
 } from "lucide-react";
 import { z } from "zod";
 import {
@@ -25,6 +36,7 @@ import {
   Badge,
   Button,
   Dialog,
+  DirectoryToolbar,
   EmptyState,
   Input,
   Menu,
@@ -38,12 +50,17 @@ import { errorText, remove, request } from "../lib/api";
 import { useConnection, useEvents } from "../lib/events";
 import {
   blockSchema,
+  compactionSchema,
   messageSchema,
   modelSchema,
   modeSchema,
+  rollbackSchema,
   runSchema,
   sessionSchema,
   settingsSchema,
+  type Chapter,
+  type Compaction,
+  type Entry,
   type Message,
   type Model,
   type Run,
@@ -52,10 +69,19 @@ import {
 } from "../lib/schema";
 import "./chat.css";
 
+const REASONING_EFFORT_KEY = "inkwell:reasoning-effort";
 const modes = [
   { value: "discuss", label: "讨论" },
   { value: "write", label: "写作" },
   { value: "review", label: "审阅" },
+] as const;
+
+const reasoningEfforts = [
+  { value: "default", label: "思考 · 默认" },
+  { value: "low", label: "思考 · 低" },
+  { value: "medium", label: "思考 · 中" },
+  { value: "high", label: "思考 · 高" },
+  { value: "xhigh", label: "思考 · 最高" },
 ] as const;
 
 const modeLabels: Readonly<Record<Session["mode"], string>> = {
@@ -188,6 +214,12 @@ function formatTokenCount(count: number): string {
   return String(count);
 }
 
+function formatDurationMs(ms: number): string {
+  if (ms <= 0) return "";
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
 function formatRelativeTime(iso: string): string {
   if (!iso) return "";
   const ts = Date.parse(iso);
@@ -214,6 +246,30 @@ function parseBlocks(message: Message) {
   }
 }
 
+function readDraft(key: string): string {
+  try {
+    return localStorage.getItem(key) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function writeDraft(key: string, value: string) {
+  try {
+    if (value) localStorage.setItem(key, value);
+    else localStorage.removeItem(key);
+  } catch {
+    /* Optional preference. */
+  }
+}
+
+type EntityReferenceItem = {
+  targetType: "chapter" | "entry";
+  targetId: string;
+  title: string;
+  label: string;
+};
+
 type ToolStep = {
   kind: "tool";
   callId: string;
@@ -225,18 +281,36 @@ type ToolStep = {
 };
 
 type ProcessStep =
-  | { kind: "reasoning"; id: string; text: string }
+  | { kind: "reasoning"; id: string; text: string; durationMs?: number }
   | { kind: "note"; id: string; text: string }
   | ToolStep;
 
 type DisplayTurn =
-  | { kind: "user"; id: string; text: string; malformed?: boolean }
-  | { kind: "assistant"; id: string; steps: ProcessStep[]; finalText: string; malformed?: boolean };
+  | {
+      kind: "user";
+      id: string;
+      firstMessageId: string;
+      lastMessageId: string;
+      text: string;
+      malformed?: boolean;
+    }
+  | {
+      kind: "assistant";
+      id: string;
+      firstMessageId: string;
+      lastMessageId: string;
+      steps: ProcessStep[];
+      finalText: string;
+      reasoningDurationMs: number;
+      malformed?: boolean;
+    };
 
 function groupMessagesIntoTurns(messages: Message[]): DisplayTurn[] {
   const turns: DisplayTurn[] = [];
   let current: {
     id: string;
+    firstMessageId: string;
+    lastMessageId: string;
     segments: {
       id: string;
       hasToolCalls: boolean;
@@ -276,11 +350,19 @@ function groupMessagesIntoTurns(messages: Message[]): DisplayTurn[] {
       }
     }
 
+    const reasoningDurationMs = steps.reduce(
+      (sum, step) => sum + (step.kind === "reasoning" ? (step.durationMs ?? 0) : 0),
+      0,
+    );
+
     turns.push({
       kind: "assistant",
       id: current.id,
+      firstMessageId: current.firstMessageId,
+      lastMessageId: current.lastMessageId,
       steps,
       finalText,
+      reasoningDurationMs,
       malformed: hasMalformed,
     });
     current = null;
@@ -305,6 +387,8 @@ function groupMessagesIntoTurns(messages: Message[]): DisplayTurn[] {
       turns.push({
         kind: "user",
         id: message.id,
+        firstMessageId: message.id,
+        lastMessageId: message.id,
         text: userText,
         malformed: blocks === null,
       });
@@ -312,7 +396,15 @@ function groupMessagesIntoTurns(messages: Message[]): DisplayTurn[] {
     }
 
     if (!current) {
-      current = { id: message.id, segments: [], toolById: new Map() };
+      current = {
+        id: message.id,
+        firstMessageId: message.id,
+        lastMessageId: message.id,
+        segments: [],
+        toolById: new Map(),
+      };
+    } else {
+      current.lastMessageId = message.id;
     }
 
     if (!blocks) {
@@ -367,7 +459,12 @@ function groupMessagesIntoTurns(messages: Message[]): DisplayTurn[] {
     let hasToolCalls = false;
     blocks.forEach((block, index) => {
       if (block.type === "reasoning" && block.text.trim()) {
-        segSteps.push({ kind: "reasoning", id: `${message.id}:r:${index}`, text: block.text });
+        segSteps.push({
+          kind: "reasoning",
+          id: `${message.id}:r:${index}`,
+          text: block.text,
+          durationMs: block.duration_ms,
+        });
       } else if (block.type === "text" && block.text.trim()) {
         texts.push(block.text);
       } else if (block.type === "tool_call") {
@@ -446,10 +543,12 @@ function ToolStepRow({ step }: { step: ToolStep }) {
 
 function ProcessDisclosure({
   steps,
+  durationMs = 0,
   streaming = false,
   defaultOpen = false,
 }: {
   steps: ProcessStep[];
+  durationMs?: number;
   streaming?: boolean;
   defaultOpen?: boolean;
 }) {
@@ -474,18 +573,23 @@ function ProcessDisclosure({
   const hasReasoning = steps.some((step) => step.kind === "reasoning");
   const tools = steps.filter((step): step is ToolStep => step.kind === "tool");
   const runningTool = tools.find((tool) => !tool.done);
+  const durationLabel = formatDurationMs(durationMs);
 
   let label = "思考过程";
   if (streaming) {
     if (runningTool) {
       label = `正在${toolName(runningTool.name)}…`;
     } else if (hasReasoning) {
-      label = "正在思考…";
+      label = durationLabel ? `正在思考 ${durationLabel}…` : "正在思考…";
     } else {
       label = "正在整理…";
     }
   } else if (hasReasoning && tools.length > 0) {
-    label = `已思考 · 调用 ${tools.length} 项工具`;
+    label = durationLabel
+      ? `已思考 ${durationLabel} · 调用 ${tools.length} 项工具`
+      : `已思考 · 调用 ${tools.length} 项工具`;
+  } else if (hasReasoning) {
+    label = durationLabel ? `思考过程 · ${durationLabel}` : "思考过程";
   } else if (tools.length > 0) {
     label = `已调用 ${tools.length} 项工具`;
   }
@@ -530,14 +634,78 @@ function ProcessDisclosure({
   );
 }
 
-function TurnView({ turn }: { turn: DisplayTurn }) {
+function CopyButton({ content }: { content: string }) {
+  const [copied, setCopied] = useState(false);
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(content);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1400);
+    } catch {
+      /* Clipboard unavailable. */
+    }
+  }
+
+  return (
+    <button
+      type="button"
+      className="message-action-btn"
+      title={copied ? "已复制" : "复制"}
+      aria-label="复制消息"
+      onClick={() => void copy()}
+    >
+      {copied ? <Check size={12} /> : <Copy size={12} />}
+      <span>{copied ? "已复制" : "复制"}</span>
+    </button>
+  );
+}
+
+function TurnView({
+  turn,
+  locked,
+  onRollback,
+  onFork,
+}: {
+  turn: DisplayTurn;
+  locked: boolean;
+  onRollback: (messageId: string) => void;
+  onFork: (messageId: string) => void;
+}) {
   if (turn.kind === "user") {
     return (
-      <article className="message message-user">
-        {turn.malformed ? (
-          <Alert>这条历史消息格式无法识别。</Alert>
-        ) : (
-          <div className="message-user-text">{turn.text}</div>
+      <article className="message message-user-wrap">
+        <div className="message-user">
+          {turn.malformed ? (
+            <Alert>这条历史消息格式无法识别。</Alert>
+          ) : (
+            <div className="message-user-text">{turn.text}</div>
+          )}
+        </div>
+        {!turn.malformed && (
+          <div className="message-hover-actions is-right">
+            <CopyButton content={turn.text} />
+            <button
+              type="button"
+              className="message-action-btn"
+              disabled={locked}
+              title="回滚并重改这条提问"
+              onClick={() => onRollback(turn.firstMessageId)}
+            >
+              <RotateCcw size={12} />
+              <span>回滚</span>
+            </button>
+            <button
+              type="button"
+              className="message-action-btn"
+              disabled={locked}
+              title="从这里分支出新对话"
+              onClick={() => onFork(turn.firstMessageId)}
+            >
+              <GitBranch size={12} />
+              <span>分支</span>
+            </button>
+          </div>
         )}
       </article>
     );
@@ -546,16 +714,74 @@ function TurnView({ turn }: { turn: DisplayTurn }) {
   return (
     <article className="message message-assistant">
       {turn.malformed && <Alert>这条历史消息格式无法识别。</Alert>}
-      <ProcessDisclosure steps={turn.steps} />
+      <ProcessDisclosure steps={turn.steps} durationMs={turn.reasoningDurationMs} />
       {turn.finalText && <Markdown content={turn.finalText} className="message-markdown" />}
+      {!turn.malformed && (
+        <div className="message-hover-actions">
+          {turn.finalText && <CopyButton content={turn.finalText} />}
+          <button
+            type="button"
+            className="message-action-btn"
+            disabled={locked}
+            title="从这里分支出新对话"
+            onClick={() => onFork(turn.lastMessageId)}
+          >
+            <GitBranch size={12} />
+            <span>分支</span>
+          </button>
+        </div>
+      )}
     </article>
   );
 }
 
 type ToolState = { id: string; name: string; status: "running" | "done" | "error" };
-type LiveTurn = { runId: string; text: string; reasoning: string; tools: ToolState[] };
+type LiveTurn = {
+  runId: string;
+  text: string;
+  reasoning: string;
+  reasoningStartedAt: number | null;
+  reasoningDurationMs: number;
+  tools: ToolState[];
+};
 type LiveQuestion = { runId: string; question: string; options: string[] };
-const emptyTurn = (): LiveTurn => ({ runId: "", text: "", reasoning: "", tools: [] });
+const emptyTurn = (): LiveTurn => ({
+  runId: "",
+  text: "",
+  reasoning: "",
+  reasoningStartedAt: null,
+  reasoningDurationMs: 0,
+  tools: [],
+});
+
+function buildReferenceCandidates(
+  chapters: Chapter[],
+  entries: Entry[],
+  visibilityScope: Session["visibility_scope"],
+): EntityReferenceItem[] {
+  const chapterRefs: EntityReferenceItem[] = chapters.map((chapter) => ({
+    targetType: "chapter",
+    targetId: chapter.id,
+    title: chapter.title,
+    label: "章节",
+  }));
+  const entryRefs: EntityReferenceItem[] = entries
+    .filter((entry) => visibilityScope === "global" || entry.visibility === "local")
+    .map((entry) => ({
+      targetType: "entry",
+      targetId: entry.id,
+      title: entry.title,
+      label:
+        entry.kind === "character"
+          ? "人物"
+          : entry.kind === "world"
+            ? "世界"
+            : entry.kind === "outline"
+              ? "提纲"
+              : "笔记",
+    }));
+  return [...chapterRefs, ...entryRefs];
+}
 
 function ComposerArea({
   text,
@@ -565,9 +791,14 @@ function ComposerArea({
   modelId,
   onModelChange,
   models,
+  reasoningEffort,
+  onReasoningEffortChange,
   visibilityScope,
   onVisibilityChange,
   visibilityPermanent,
+  references,
+  onReferencesChange,
+  candidates,
   running,
   waiting,
   locked,
@@ -587,9 +818,14 @@ function ComposerArea({
   modelId: string;
   onModelChange: (value: string) => void;
   models: Model[];
+  reasoningEffort: string;
+  onReasoningEffortChange: (value: string) => void;
   visibilityScope: Session["visibility_scope"];
   onVisibilityChange: (next: Session["visibility_scope"]) => void;
   visibilityPermanent: boolean;
+  references: EntityReferenceItem[];
+  onReferencesChange: (refs: EntityReferenceItem[]) => void;
+  candidates: EntityReferenceItem[];
   running: boolean;
   waiting: boolean;
   locked: boolean;
@@ -602,6 +838,60 @@ function ComposerArea({
   canCancel?: boolean;
   onCancel?: () => void;
 }) {
+  const [mentionOpen, setMentionOpen] = useState(false);
+  const [mentionQuery, setMentionQuery] = useState("");
+  const [mentionIndex, setMentionIndex] = useState(0);
+
+  const filteredCandidates = useMemo(() => {
+    if (!mentionOpen) return [];
+    const q = mentionQuery.trim().toLowerCase();
+    return candidates
+      .filter(
+        (item) =>
+          !references.some(
+            (ref) => ref.targetType === item.targetType && ref.targetId === item.targetId,
+          ) &&
+          (!q || item.title.toLowerCase().includes(q) || item.label.includes(q)),
+      )
+      .slice(0, 8);
+  }, [mentionOpen, mentionQuery, candidates, references]);
+
+  function handleTextChange(next: string) {
+    onTextChange(next);
+    const match = /(?:^|\s)@([^\s@]*)$/.exec(next);
+    if (match && candidates.length > 0) {
+      setMentionOpen(true);
+      setMentionQuery(match[1] ?? "");
+      setMentionIndex(0);
+    } else {
+      setMentionOpen(false);
+    }
+  }
+
+  function pickCandidate(item: EntityReferenceItem) {
+    const cleaned = text.replace(/(?:^|\s)@([^\s@]*)$/, (full, _q, offset: number) =>
+      offset === 0 ? "" : full.startsWith(" ") ? " " : "",
+    );
+    onTextChange(cleaned);
+    onReferencesChange([...references, item]);
+    setMentionOpen(false);
+    window.setTimeout(() => inputRef?.current?.focus(), 0);
+  }
+
+  function insertAtTrigger() {
+    if (candidates.length === 0) return;
+    if (mentionOpen) {
+      setMentionOpen(false);
+      return;
+    }
+    const next = text && !text.endsWith(" ") && !text.endsWith("\n") ? `${text} @` : `${text}@`;
+    onTextChange(next);
+    setMentionOpen(true);
+    setMentionQuery("");
+    setMentionIndex(0);
+    window.setTimeout(() => inputRef?.current?.focus(), 0);
+  }
+
   return (
     <div className="chat-composer-area">
       {(waiting || running) && runStatusText && (
@@ -615,16 +905,92 @@ function ComposerArea({
           )}
         </div>
       )}
+      {mentionOpen && filteredCandidates.length > 0 && (
+        <div className="mention-popover" role="listbox" aria-label="引用章节或设定">
+          {filteredCandidates.map((item, idx) => (
+            <button
+              key={`${item.targetType}:${item.targetId}`}
+              type="button"
+              role="option"
+              aria-selected={idx === mentionIndex}
+              className={`mention-option ${idx === mentionIndex ? "is-active" : ""}`}
+              onClick={() => pickCandidate(item)}
+            >
+              <Badge>{item.label}</Badge>
+              <span>{item.title}</span>
+            </button>
+          ))}
+        </div>
+      )}
       <div className="chat-composer">
+        {references.length > 0 && (
+          <div className="composer-refs" aria-label="本轮已引用资料">
+            {references.map((ref) => (
+              <span className="composer-ref-chip" key={`${ref.targetType}:${ref.targetId}`}>
+                {ref.targetType === "chapter" ? <BookOpen size={11} /> : <NotebookPen size={11} />}
+                <span>
+                  {ref.label} · {ref.title}
+                </span>
+                <button
+                  type="button"
+                  aria-label={`移除引用 ${ref.title}`}
+                  onClick={() =>
+                    onReferencesChange(
+                      references.filter(
+                        (item) =>
+                          !(item.targetType === ref.targetType && item.targetId === ref.targetId),
+                      ),
+                    )
+                  }
+                >
+                  <X size={11} />
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
         <Textarea
           ref={inputRef}
           aria-label={running ? "中途补充要求" : "输入消息"}
-          placeholder={running ? "补充一句…" : "输入想法或写作要求…"}
+          placeholder={
+            running
+              ? "补充一句…"
+              : candidates.length > 0
+                ? "输入想法，或输入 @ 引用章节与设定…"
+                : "输入想法或写作要求…"
+          }
           value={text}
-          onChange={(event) => onTextChange(event.target.value)}
+          onChange={(event) => handleTextChange(event.target.value)}
           disabled={waiting}
           rows={3}
           onKeyDown={(event) => {
+            if (mentionOpen && filteredCandidates.length > 0) {
+              if (event.key === "ArrowDown") {
+                event.preventDefault();
+                setMentionIndex((idx) => (idx + 1) % filteredCandidates.length);
+                return;
+              }
+              if (event.key === "ArrowUp") {
+                event.preventDefault();
+                setMentionIndex(
+                  (idx) => (idx - 1 + filteredCandidates.length) % filteredCandidates.length,
+                );
+                return;
+              }
+              if (event.key === "Enter" || event.key === "Tab") {
+                const picked = filteredCandidates[mentionIndex] ?? filteredCandidates[0];
+                if (picked) {
+                  event.preventDefault();
+                  pickCandidate(picked);
+                  return;
+                }
+              }
+              if (event.key === "Escape") {
+                event.preventDefault();
+                setMentionOpen(false);
+                return;
+              }
+            }
             if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && !running) {
               event.preventDefault();
               onSend();
@@ -667,8 +1033,29 @@ function ComposerArea({
               ]}
               onChange={onModelChange}
             />
+            <Select
+              compact
+              label="思考强度"
+              value={reasoningEffort}
+              disabled={running || busy}
+              icon={<Gauge size={12} />}
+              options={[...reasoningEfforts]}
+              onChange={onReasoningEffortChange}
+            />
           </div>
           <div className="composer-actions">
+            {candidates.length > 0 && !running && (
+              <button
+                type="button"
+                className="composer-visibility-pill"
+                disabled={locked}
+                title="引用章节或设定（@）"
+                aria-label="引用资料"
+                onClick={insertAtTrigger}
+              >
+                <AtSign size={12} />
+              </button>
+            )}
             {visibilityPermanent && visibilityScope === "global" ? (
               <button
                 type="button"
@@ -735,9 +1122,15 @@ function SessionChat({
   defaultModelId,
   modelId,
   onModelChange,
+  reasoningEffort,
+  onReasoningEffortChange,
+  chapters,
+  entries,
   initialRuns,
   onRunsChange,
+  onCompactionsChange,
   onUpdated,
+  onForked,
   onPending,
   inputRef,
 }: {
@@ -746,16 +1139,25 @@ function SessionChat({
   defaultModelId: string | null;
   modelId: string;
   onModelChange: (value: string) => void;
+  reasoningEffort: string;
+  onReasoningEffortChange: (value: string) => void;
+  chapters: Chapter[];
+  entries: Entry[];
   initialRuns?: Run[];
   onRunsChange: (runs: Run[]) => void;
+  onCompactionsChange: (compactions: Compaction[]) => void;
   onUpdated: (session: Session) => void;
+  onForked: (session: Session) => void;
   onPending: (id: string) => void;
   inputRef: React.RefObject<HTMLTextAreaElement | null>;
 }) {
+  const draftKey = `inkwell:chat-draft:s:${session.id}`;
   const [messages, setMessages] = useState<Message[]>([]);
   const [runs, setRuns] = useState<Run[]>(initialRuns ?? []);
   const [live, setLive] = useState<LiveTurn>(emptyTurn);
-  const [text, setText] = useState("");
+  const [liveElapsedMs, setLiveElapsedMs] = useState(0);
+  const [text, setText] = useState(() => readDraft(draftKey));
+  const [references, setReferences] = useState<EntityReferenceItem[]>([]);
   const [answer, setAnswer] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -772,11 +1174,36 @@ function SessionChat({
   const followOutput = useRef(true);
   const onRunsChangeRef = useRef(onRunsChange);
   onRunsChangeRef.current = onRunsChange;
+  const onCompactionsChangeRef = useRef(onCompactionsChange);
+  onCompactionsChangeRef.current = onCompactionsChange;
+
+  const updateText = useCallback(
+    (next: string) => {
+      setText(next);
+      writeDraft(draftKey, next);
+    },
+    [draftKey],
+  );
+
+  useEffect(() => {
+    setText(readDraft(draftKey));
+    setReferences([]);
+  }, [draftKey]);
 
   useEffect(() => {
     const element = historyElement.current;
     if (element && followOutput.current) element.scrollTop = element.scrollHeight;
   }, [messages, live, pending, notice]);
+
+  useEffect(() => {
+    if (!live.reasoningStartedAt || live.reasoningDurationMs > 0) {
+      setLiveElapsedMs(0);
+      return;
+    }
+    const start = live.reasoningStartedAt;
+    const id = window.setInterval(() => setLiveElapsedMs(Date.now() - start), 120);
+    return () => window.clearInterval(id);
+  }, [live.reasoningStartedAt, live.reasoningDurationMs]);
 
   const refresh = useCallback(async () => {
     const sequence = ++fetchSequence.current;
@@ -790,6 +1217,18 @@ function SessionChat({
       setMessages(history);
       setRuns(records);
       onRunsChangeRef.current(records);
+      if (records.some((run) => run.input_tokens > 0)) {
+        void request(`/sessions/${session.id}/compactions`, z.array(compactionSchema))
+          .then((anchors) => {
+            if (mounted.current && sequence === fetchSequence.current)
+              onCompactionsChangeRef.current(anchors);
+          })
+          .catch(() => {
+            /* Optional compaction status. */
+          });
+      } else {
+        onCompactionsChangeRef.current([]);
+      }
       setLive((old) =>
         records.some((run) => run.id === old.runId && run.status !== "running") ? emptyTurn() : old,
       );
@@ -838,20 +1277,28 @@ function SessionChat({
         setEventRunning(true);
         setLive((old) => {
           const next = old.runId === event.run_id ? old : { ...emptyTurn(), runId: event.run_id };
-          return event.type === "text_delta"
-            ? { ...next, text: next.text + event.delta }
-            : { ...next, reasoning: next.reasoning + event.delta };
+          if (event.type === "text_delta") {
+            return { ...next, text: next.text + event.delta };
+          }
+          return {
+            ...next,
+            reasoning: next.reasoning + event.delta,
+            reasoningStartedAt: next.reasoningStartedAt ?? Date.now(),
+          };
         });
+      } else if (event.type === "reasoning_completed") {
+        setLive((old) =>
+          old.runId === event.run_id
+            ? { ...old, reasoningDurationMs: old.reasoningDurationMs + event.duration_ms }
+            : old,
+        );
       } else if (event.type === "attempt_reset") {
         setLive({ ...emptyTurn(), runId: event.run_id });
         setNotice(`第 ${event.attempt} 次重试：${event.reason}`);
       } else if (event.type === "tool_start") {
-        // The assistant message is persisted before tool_start. Its streamed copy
-        // must be removed when loading that message, before the next model turn.
         setLive((old) => ({
+          ...emptyTurn(),
           runId: event.run_id,
-          text: "",
-          reasoning: "",
           tools: [
             ...old.tools.filter((tool) => tool.id !== event.call_id),
             { id: event.call_id, name: event.name, status: "running" },
@@ -913,6 +1360,10 @@ function SessionChat({
   const effectiveModel = modelId === "default" ? defaultModelId : modelId;
   const availableModel = models.some((model) => model.id === effectiveModel && model.enabled);
 
+  const candidates = useMemo(
+    () => buildReferenceCandidates(chapters, entries, session.visibility_scope),
+    [chapters, entries, session.visibility_scope],
+  );
   const turns = useMemo(() => groupMessagesIntoTurns(messages), [messages]);
   const liveSteps: ProcessStep[] = [];
   if (live.reasoning) {
@@ -932,6 +1383,7 @@ function SessionChat({
     }
   }
   const showLiveStream = Boolean(live.text) || liveSteps.length > 0;
+  const liveDuration = live.reasoningDurationMs > 0 ? live.reasoningDurationMs : liveElapsedMs;
 
   async function perform(action: () => Promise<void>) {
     setBusy(true);
@@ -948,13 +1400,23 @@ function SessionChat({
   async function send() {
     if (!text.trim() || locked) return;
     const sent = text;
+    const sentRefs = references.map((ref) => ({
+      target_type: ref.targetType,
+      target_id: ref.targetId,
+    }));
     await perform(async () => {
       const run = await request(`/sessions/${session.id}/runs`, runSchema, {
         method: "POST",
-        body: { text: sent, model_id: modelId === "default" ? null : modelId },
+        body: {
+          text: sent,
+          model_id: modelId === "default" ? null : modelId,
+          ...(reasoningEffort === "default" ? {} : { reasoning_effort: reasoningEffort }),
+          ...(sentRefs.length > 0 ? { references: sentRefs } : {}),
+        },
       });
       if (!mounted.current) return;
-      setText((current) => (current === sent ? "" : current));
+      updateText("");
+      setReferences([]);
       setRuns((old) => {
         const next = [run, ...old.filter((item) => item.id !== run.id)];
         onRunsChangeRef.current(next);
@@ -970,7 +1432,11 @@ function SessionChat({
     await perform(async () => {
       const run = await request(`/runs/${waiting}/answer`, runSchema, {
         method: "POST",
-        body: { text: sent, ...(modelId === "default" ? {} : { model_id: modelId }) },
+        body: {
+          text: sent,
+          ...(modelId === "default" ? {} : { model_id: modelId }),
+          ...(reasoningEffort === "default" ? {} : { reasoning_effort: reasoningEffort }),
+        },
       });
       if (!mounted.current) return;
       setLiveQuestion(null);
@@ -981,6 +1447,30 @@ function SessionChat({
         return next;
       });
       await refresh();
+    });
+  }
+
+  function handleRollback(messageId: string) {
+    void perform(async () => {
+      const result = await request(`/sessions/${session.id}/rollback`, rollbackSchema, {
+        method: "POST",
+        body: { message_id: messageId },
+      });
+      if (!mounted.current) return;
+      if (result.user_text) updateText(result.user_text);
+      await refresh();
+      window.setTimeout(() => inputRef.current?.focus(), 0);
+    });
+  }
+
+  function handleFork(messageId: string) {
+    void perform(async () => {
+      const branch = await request(`/sessions/${session.id}/fork`, sessionSchema, {
+        method: "POST",
+        body: { message_id: messageId },
+      });
+      if (!mounted.current) return;
+      onForked(branch);
     });
   }
 
@@ -1014,12 +1504,19 @@ function SessionChat({
           turns.length === 0 && !showLiveStream && <EmptyState title="暂无消息" />
         )}
         {turns.map((turn) => (
-          <TurnView key={turn.id} turn={turn} />
+          <TurnView
+            key={turn.id}
+            turn={turn}
+            locked={locked}
+            onRollback={handleRollback}
+            onFork={handleFork}
+          />
         ))}
         {showLiveStream && (
           <article className="message message-assistant stream" aria-label="正在生成">
             <ProcessDisclosure
               steps={liveSteps}
+              durationMs={liveDuration}
               streaming={running && !live.text}
               defaultOpen={!live.text}
             />
@@ -1075,7 +1572,7 @@ function SessionChat({
       </div>
       <ComposerArea
         text={text}
-        onTextChange={setText}
+        onTextChange={updateText}
         mode={session.mode}
         onModeChange={(nextMode) => {
           void perform(async () =>
@@ -1090,6 +1587,8 @@ function SessionChat({
         modelId={modelId}
         onModelChange={onModelChange}
         models={models}
+        reasoningEffort={reasoningEffort}
+        onReasoningEffortChange={onReasoningEffortChange}
         visibilityScope={session.visibility_scope}
         onVisibilityChange={(nextScope) => {
           if (nextScope !== "global" || session.visibility_scope === "global") return;
@@ -1103,6 +1602,9 @@ function SessionChat({
           );
         }}
         visibilityPermanent
+        references={references}
+        onReferencesChange={setReferences}
+        candidates={candidates}
         running={running}
         waiting={Boolean(waiting)}
         locked={locked}
@@ -1123,7 +1625,7 @@ function SessionChat({
                 body: { text: sent },
               },
             );
-            setText((current) => (current === sent ? "" : current));
+            updateText("");
           });
         }}
         runStatusText={waiting ? "等待你的决定" : running ? "正在生成…" : undefined}
@@ -1147,6 +1649,8 @@ function SessionChat({
 
 type ChatPanelProps = {
   bookId: string;
+  chapters?: Chapter[];
+  entries?: Entry[];
   onPending: (id: string) => void;
   expanded?: boolean;
   toolbarStart?: ReactNode;
@@ -1155,23 +1659,40 @@ type ChatPanelProps = {
 
 function BookChat({
   bookId,
+  chapters = [],
+  entries = [],
   onPending,
   expanded = false,
   toolbarStart,
   sidebarTarget,
 }: ChatPanelProps) {
+  const draftKey = `inkwell:chat-draft:b:${bookId}`;
   const [sessions, setSessions] = useState<Session[]>([]);
   const [sessionId, setSessionId] = useState("");
+  const [sortBy, setSortBy] = useState<"updated" | "title">("updated");
+  const [sessionFilter, setSessionFilter] = useState("");
   const [drafting, setDrafting] = useState(false);
-  const [draftText, setDraftText] = useState("");
+  const [draftText, setDraftText] = useState(() => readDraft(draftKey));
   const [draftMode, setDraftMode] = useState<Session["mode"]>("discuss");
   const [draftModelId, setDraftModelId] = useState("default");
+  const [reasoningEffort, setReasoningEffort] = useState(() => {
+    try {
+      return localStorage.getItem(REASONING_EFFORT_KEY) ?? "default";
+    } catch {
+      return "default";
+    }
+  });
   const [draftVisibility, setDraftVisibility] = useState<Session["visibility_scope"]>("local");
+  const [draftRefs, setDraftRefs] = useState<EntityReferenceItem[]>([]);
   const [runsBySession, setRunsBySession] = useState<Record<string, Run[]>>({});
+  const [compactionsBySession, setCompactionsBySession] = useState<Record<string, Compaction[]>>(
+    {},
+  );
+  const [compacting, setCompacting] = useState(false);
   const [models, setModels] = useState<Model[]>([]);
   const [defaultModelId, setDefaultModelId] = useState<string | null>(null);
   const [error, setError] = useState("");
-  const [editing, setEditing] = useState<"rename" | "delete" | null>(null);
+  const [editing, setEditing] = useState<"rename" | "delete" | "clear_all" | null>(null);
   const [editingId, setEditingId] = useState("");
   const [title, setTitle] = useState("");
   const [busy, setBusy] = useState(false);
@@ -1182,6 +1703,23 @@ function BookChat({
   draftingRef.current = drafting;
   const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
   const connection = useConnection();
+
+  const updateReasoningEffort = useCallback((value: string) => {
+    setReasoningEffort(value);
+    try {
+      localStorage.setItem(REASONING_EFFORT_KEY, value);
+    } catch {
+      /* Optional preference. */
+    }
+  }, []);
+
+  const updateDraftText = useCallback(
+    (value: string) => {
+      setDraftText(value);
+      writeDraft(draftKey, value);
+    },
+    [draftKey],
+  );
 
   const focusComposer = useCallback(() => {
     window.setTimeout(() => composerInputRef.current?.focus(), 0);
@@ -1236,9 +1774,30 @@ function BookChat({
     ),
   );
 
+  const sortedSessions = useMemo(() => {
+    return [...sessions].sort((a, b) => {
+      if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+      if (sortBy === "title") return (a.title || "").localeCompare(b.title || "", "zh-CN");
+      return (b.updated_at || b.created_at).localeCompare(a.updated_at || a.created_at);
+    });
+  }, [sessions, sortBy]);
+
+  const visibleSessions = useMemo(() => {
+    const q = sessionFilter.trim().toLowerCase();
+    return q
+      ? sortedSessions.filter((session) => (session.title || "新对话").toLowerCase().includes(q))
+      : sortedSessions;
+  }, [sortedSessions, sessionFilter]);
+
   const selected = sessions.find((session) => session.id === sessionId);
   const editingSession = sessions.find((session) => session.id === editingId);
   const selectedRuns = selected ? runsBySession[selected.id] : undefined;
+  const selectedCompactions = selected ? compactionsBySession[selected.id] : undefined;
+
+  const draftCandidates = useMemo(
+    () => buildReferenceCandidates(chapters, entries, draftVisibility),
+    [chapters, entries, draftVisibility],
+  );
 
   function openNewBlankChat() {
     setError("");
@@ -1248,6 +1807,7 @@ function BookChat({
   }
 
   function selectExistingSession(id: string) {
+    setError("");
     setDrafting(false);
     setSessionId(id);
   }
@@ -1258,22 +1818,41 @@ function BookChat({
     setEditing(action);
   }
 
+  async function togglePin(session: Session) {
+    setError("");
+    try {
+      const updated = await request(`/sessions/${session.id}`, sessionSchema, {
+        method: "PATCH",
+        body: { pinned: !session.pinned },
+      });
+      setSessions((old) => old.map((item) => (item.id === updated.id ? updated : item)));
+    } catch (reason) {
+      setError(errorText(reason));
+    }
+  }
+
   async function saveSessionAction() {
-    if (!editing || !editingSession) {
+    if (!editing) return;
+    if (editing !== "clear_all" && !editingSession) {
       setEditing(null);
       return;
     }
     setBusy(true);
     setError("");
     try {
-      if (editing === "delete") {
+      if (editing === "clear_all") {
+        await remove(`/books/${bookId}/sessions`);
+        setSessions([]);
+        setSessionId("");
+        setDrafting(true);
+      } else if (editing === "delete" && editingSession) {
         const removedId = editingSession.id;
         await remove(`/sessions/${removedId}`);
         setSessions((old) => old.filter((item) => item.id !== removedId));
         if (sessionId === removedId) {
           setSessionId("");
         }
-      } else {
+      } else if (editingSession) {
         await request(`/sessions/${editingSession.id}`, sessionSchema, {
           method: "PATCH",
           body: { title: title.trim() || "未命名对话" },
@@ -1293,6 +1872,10 @@ function BookChat({
   async function sendBlankDraft() {
     if (!draftText.trim() || busy) return;
     const sent = draftText;
+    const sentRefs = draftRefs.map((ref) => ({
+      target_type: ref.targetType,
+      target_id: ref.targetId,
+    }));
     setBusy(true);
     setError("");
     let createdSession: Session | null = null;
@@ -1307,10 +1890,16 @@ function BookChat({
       });
       const run = await request(`/sessions/${createdSession.id}/runs`, runSchema, {
         method: "POST",
-        body: { text: sent, model_id: draftModelId === "default" ? null : draftModelId },
+        body: {
+          text: sent,
+          model_id: draftModelId === "default" ? null : draftModelId,
+          ...(reasoningEffort === "default" ? {} : { reasoning_effort: reasoningEffort }),
+          ...(sentRefs.length > 0 ? { references: sentRefs } : {}),
+        },
       });
       if (!mounted.current) return;
-      setDraftText("");
+      updateDraftText("");
+      setDraftRefs([]);
       setDrafting(false);
       setRunsBySession((old) => ({ ...old, [createdSession!.id]: [run] }));
       setSessions((old) => [createdSession!, ...old]);
@@ -1330,14 +1919,42 @@ function BookChat({
     }
   }
 
+  async function compactSession() {
+    if (!selected || compacting) return;
+    setCompacting(true);
+    setError("");
+    try {
+      const anchor = await request(`/sessions/${selected.id}/compact`, compactionSchema, {
+        method: "POST",
+        body: { keep_recent_turns: 4 },
+      });
+      setCompactionsBySession((old) => ({
+        ...old,
+        [selected.id]: [anchor, ...(old[selected.id] ?? [])],
+      }));
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      setCompacting(false);
+    }
+  }
+
   const effectiveDraftModel = draftModelId === "default" ? defaultModelId : draftModelId;
   const availableDraftModel = models.some(
     (model) => model.id === effectiveDraftModel && model.enabled,
   );
 
+  const canShowCompact = Boolean(
+    selected &&
+    ((selectedRuns && selectedRuns.length > 0) || (selectedCompactions?.length ?? 0) > 0),
+  );
+  const hasActiveRun = (selectedRuns ?? []).some(
+    (run) => run.status === "running" || run.status === "waiting_user",
+  );
+
   let usageRow: ReactNode = null;
-  if (selected && selectedRuns && selectedRuns.length > 0) {
-    const totals = selectedRuns.reduce(
+  if (canShowCompact && selected) {
+    const totals = (selectedRuns ?? []).reduce(
       (acc, run) => ({
         input: acc.input + run.input_tokens,
         output: acc.output + run.output_tokens,
@@ -1345,13 +1962,13 @@ function BookChat({
       }),
       { input: 0, output: 0, cache: 0 },
     );
-    const latestWithTokens = selectedRuns.find((run) => run.input_tokens > 0);
+    const latestWithTokens = (selectedRuns ?? []).find((run) => run.input_tokens > 0);
     const latestModel = latestWithTokens?.model_id
       ? models.find((item) => item.id === latestWithTokens.model_id)
       : models.find((item) => item.id === defaultModelId);
     const contextLimit = latestModel?.context_window ?? null;
     const latestInput = latestWithTokens?.input_tokens ?? 0;
-    if (totals.input > 0 || totals.output > 0) {
+    if (totals.input > 0 || totals.output > 0 || (selectedCompactions?.length ?? 0) > 0) {
       const pct =
         contextLimit && contextLimit > 0
           ? Math.min(100, (latestInput / contextLimit) * 100).toFixed(1)
@@ -1362,12 +1979,15 @@ function BookChat({
             输入 {formatTokenCount(totals.input)} · 输出 {formatTokenCount(totals.output)}
             {totals.cache > 0 && ` · 缓存 ${formatTokenCount(totals.cache)}`}
           </span>
-          {latestInput > 0 && (
-            <span>
-              上下文 {formatTokenCount(latestInput)}
-              {contextLimit ? ` / ${formatTokenCount(contextLimit)} (${pct}%)` : ""}
-            </span>
-          )}
+          <div className="chat-header-usage-right">
+            {latestInput > 0 && (
+              <span>
+                上下文 {formatTokenCount(latestInput)}
+                {contextLimit ? ` / ${formatTokenCount(contextLimit)} (${pct}%)` : ""}
+              </span>
+            )}
+            {(selectedCompactions?.length ?? 0) > 0 && <Badge>已压缩</Badge>}
+          </div>
         </div>
       );
     }
@@ -1379,10 +1999,12 @@ function BookChat({
         sidebarTarget &&
         createPortal(
           <>
-            <div className="directory-section-heading">
-              <h2>对话</h2>
-              <div className="directory-section-actions">
-                <span className="directory-meta">{sessions.length}</span>
+            <DirectoryToolbar
+              searchValue={sessionFilter}
+              onSearchChange={setSessionFilter}
+              searchLabel="筛选对话"
+              searchPlaceholder="筛选对话…"
+              create={
                 <Button
                   variant="ghost"
                   className="icon-control"
@@ -1390,12 +2012,36 @@ function BookChat({
                   title="新对话"
                   onClick={openNewBlankChat}
                 >
-                  <SquarePen size={14} />
+                  <Plus size={15} />
                 </Button>
-              </div>
-            </div>
+              }
+              more={
+                <Menu label="对话列表操作" iconOnly triggerClassName="icon-control">
+                  <MenuItem onSelect={() => setSortBy("updated")}>
+                    <Check
+                      size={14}
+                      className={sortBy === "updated" ? "opacity-100" : "opacity-0"}
+                    />
+                    按最近更新排序
+                  </MenuItem>
+                  <MenuItem onSelect={() => setSortBy("title")}>
+                    <Check size={14} className={sortBy === "title" ? "opacity-100" : "opacity-0"} />
+                    按标题排序
+                  </MenuItem>
+                  {sessions.length > 0 && (
+                    <>
+                      <MenuSeparator />
+                      <MenuItem danger onSelect={() => setEditing("clear_all")}>
+                        <Trash2 size={14} />
+                        清空全部对话
+                      </MenuItem>
+                    </>
+                  )}
+                </Menu>
+              }
+            />
             <div className="chat-session-list" aria-label="对话列表">
-              {sessions.map((session) => (
+              {visibleSessions.map((session) => (
                 <div
                   className={`chat-session-row ${session.id === sessionId ? "selected" : ""}`}
                   key={session.id}
@@ -1407,6 +2053,7 @@ function BookChat({
                   >
                     <span className="chat-session-title">{session.title || "新对话"}</span>
                     <span className="chat-session-meta">
+                      {session.pinned && <Pin size={10} />}
                       <span>
                         {formatRelativeTime(session.updated_at || session.created_at) || "刚才"}
                       </span>
@@ -1417,6 +2064,10 @@ function BookChat({
                   </button>
                   <div className="chat-session-actions">
                     <Menu label={`${session.title || "新对话"}的操作`} iconOnly>
+                      <MenuItem onSelect={() => void togglePin(session)}>
+                        {session.pinned ? <PinOff size={14} /> : <Pin size={14} />}
+                        {session.pinned ? "取消置顶" : "置顶"}
+                      </MenuItem>
                       <MenuItem onSelect={() => editSession("rename", session)}>
                         <Pencil size={14} />
                         重命名
@@ -1430,7 +2081,11 @@ function BookChat({
                   </div>
                 </div>
               ))}
-              {loaded && sessions.length === 0 && <p className="directory-empty">暂无对话</p>}
+              {loaded && visibleSessions.length === 0 && (
+                <p className="directory-empty">
+                  {sessionFilter.trim() ? "没有匹配的对话" : "暂无对话"}
+                </p>
+              )}
             </div>
           </>,
           sidebarTarget,
@@ -1448,20 +2103,25 @@ function BookChat({
               </>
             )}
             <div className="chat-title-menu">
-              {sessions.length > 0 ? (
+              {sortedSessions.length > 0 ? (
                 <Menu label={selected ? selected.title || "新对话" : "新对话"} align="start">
-                  {sessions.map((session) => (
+                  {sortedSessions.map((session) => (
                     <MenuItem key={session.id} onSelect={() => selectExistingSession(session.id)}>
                       <Check
                         size={14}
                         className={session.id === sessionId ? "opacity-100" : "opacity-0"}
                       />
+                      {session.pinned && <Pin size={12} />}
                       {session.title || "新对话"}
                     </MenuItem>
                   ))}
                   {selected && (
                     <>
                       <MenuSeparator />
+                      <MenuItem onSelect={() => void togglePin(selected)}>
+                        {selected.pinned ? <PinOff size={14} /> : <Pin size={14} />}
+                        {selected.pinned ? "取消置顶" : "置顶"}
+                      </MenuItem>
                       <MenuItem onSelect={() => editSession("rename", selected)}>
                         <Pencil size={14} />
                         重命名对话
@@ -1477,7 +2137,29 @@ function BookChat({
                 <span className="chat-empty-title">新对话</span>
               )}
             </div>
-            <Button variant="ghost" aria-label="新对话" title="新对话" onClick={openNewBlankChat}>
+            {canShowCompact && (
+              <Button
+                variant="ghost"
+                className="icon-control"
+                aria-label="压缩上下文"
+                title={
+                  compacting
+                    ? "正在压缩上下文…"
+                    : "压缩上下文（将早期历史压缩为前情摘要，保留最近 4 轮）"
+                }
+                disabled={compacting || hasActiveRun}
+                onClick={() => void compactSession()}
+              >
+                <Minimize2 size={15} />
+              </Button>
+            )}
+            <Button
+              variant="ghost"
+              className="icon-control"
+              aria-label="新对话"
+              title="新对话"
+              onClick={openNewBlankChat}
+            >
               <SquarePen size={16} />
             </Button>
           </div>
@@ -1497,13 +2179,26 @@ function BookChat({
             defaultModelId={defaultModelId}
             modelId={draftModelId}
             onModelChange={setDraftModelId}
+            reasoningEffort={reasoningEffort}
+            onReasoningEffortChange={updateReasoningEffort}
+            chapters={chapters}
+            entries={entries}
             initialRuns={runsBySession[selected.id]}
             onRunsChange={(records) =>
               setRunsBySession((old) => ({ ...old, [selected.id]: records }))
             }
+            onCompactionsChange={(anchors) =>
+              setCompactionsBySession((old) => ({ ...old, [selected.id]: anchors }))
+            }
             onUpdated={(updated) =>
               setSessions((old) => old.map((item) => (item.id === updated.id ? updated : item)))
             }
+            onForked={(branch) => {
+              setSessions((old) => [branch, ...old]);
+              setDrafting(false);
+              setSessionId(branch.id);
+              void refresh();
+            }}
             onPending={onPending}
             inputRef={composerInputRef}
           />
@@ -1520,15 +2215,20 @@ function BookChat({
             </div>
             <ComposerArea
               text={draftText}
-              onTextChange={setDraftText}
+              onTextChange={updateDraftText}
               mode={draftMode}
               onModeChange={setDraftMode}
               modelId={draftModelId}
               onModelChange={setDraftModelId}
               models={models}
+              reasoningEffort={reasoningEffort}
+              onReasoningEffortChange={updateReasoningEffort}
               visibilityScope={draftVisibility}
               onVisibilityChange={setDraftVisibility}
               visibilityPermanent={false}
+              references={draftRefs}
+              onReferencesChange={setDraftRefs}
+              candidates={draftCandidates}
               running={false}
               waiting={false}
               locked={busy || !loaded}
@@ -1540,13 +2240,21 @@ function BookChat({
           </>
         )}
         <Dialog
-          title={editing === "delete" ? "删除对话" : "重命名对话"}
+          title={
+            editing === "clear_all"
+              ? "清空全部对话"
+              : editing === "delete"
+                ? "删除对话"
+                : "重命名对话"
+          }
           open={editing !== null}
           onOpenChange={(open) => {
             if (!open && !busy) setEditing(null);
           }}
         >
-          {editing === "delete" ? (
+          {editing === "clear_all" ? (
+            <p>确定清空本书全部 {sessions.length} 段对话吗？清空后无法恢复。</p>
+          ) : editing === "delete" ? (
             <p>确定删除「{editingSession?.title || "新对话"}」吗？删除后无法恢复。</p>
           ) : (
             <Input
@@ -1562,13 +2270,19 @@ function BookChat({
               取消
             </Button>
             <Button
-              variant={editing === "delete" ? "danger" : "primary"}
+              variant={editing === "delete" || editing === "clear_all" ? "danger" : "primary"}
               disabled={busy}
               onClick={() => {
                 void saveSessionAction();
               }}
             >
-              {busy ? "处理中…" : editing === "delete" ? "确认删除" : "保存"}
+              {busy
+                ? "处理中…"
+                : editing === "clear_all"
+                  ? "确认清空"
+                  : editing === "delete"
+                    ? "确认删除"
+                    : "保存"}
             </Button>
           </div>
         </Dialog>

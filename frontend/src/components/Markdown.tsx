@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 
-const INLINE_PATTERN = /(`[^`]+`|\*\*[^*\n]+?\*\*|__[^_\n]+?__|~~[^~\n]+?~~|\*[^*\n]+?\*)/g;
+const INLINE_PATTERN =
+  /(`[^`]+`|\*\*[^*\n]+?\*\*|__[^_\n]+?__|~~[^~\n]+?~~|\*[^*\n]+?\*|<u>[^<\n]+?<\/u>)/g;
 
 function renderInline(text: string, keyPrefix: string): ReactNode[] {
   const nodes: ReactNode[] = [];
@@ -25,6 +26,8 @@ function renderInline(text: string, keyPrefix: string): ReactNode[] {
       nodes.push(<del key={key}>{renderInline(token.slice(2, -2), `${key}-s`)}</del>);
     } else if (token.startsWith("*") && token.endsWith("*")) {
       nodes.push(<em key={key}>{renderInline(token.slice(1, -1), `${key}-i`)}</em>);
+    } else if (token.startsWith("<u>") && token.endsWith("</u>")) {
+      nodes.push(<u key={key}>{renderInline(token.slice(3, -4), `${key}-u`)}</u>);
     } else {
       nodes.push(token);
     }

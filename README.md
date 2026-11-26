@@ -24,7 +24,7 @@ uv run python -m backend serve --host 127.0.0.1 --port 18082
 
 打开 `http://127.0.0.1:18082/docs` 查看交互式 API 文档，`/health` 返回就绪状态。`--port 0` 可由操作系统分配端口，实际地址见启动日志。`frontend/dist` 存在时同源托管静态文件与前端页面路由；不存在时正常运行纯 API 服务。
 
-数据目录可通过 `INKWELL_DATA_DIR` 或 `--data-dir` 指定，默认使用当前用户的数据目录（Windows 为 `%LOCALAPPDATA%/Inkwell`）。数据库、加密密钥、附件、服务运行记录和日志均存于该目录。`INKWELL_HOST` 与 `INKWELL_PORT` 可设置默认监听参数；命令行参数优先。默认监听回环地址，当前服务没有远程用户认证，不应直接暴露到公网。
+数据目录可通过 `INKWELL_DATA_DIR` 或 `--data-dir` 指定，默认使用仓库根目录下的 `data/`。数据库、加密密钥、附件、本地备份、服务运行记录和日志均存于该目录。`INKWELL_HOST` 与 `INKWELL_PORT` 可设置默认监听参数；命令行参数优先。默认监听回环地址，当前服务没有远程用户认证，不应直接暴露到公网。
 
 后台生命周期管理使用固定端口，所有命令须使用同一组数据目录、host 和 port 参数：
 

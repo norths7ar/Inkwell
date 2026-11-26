@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { z } from "zod";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import {
@@ -8,88 +8,246 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  Download,
   Eye,
+  FileClock,
   FilePlus2,
+  FileText,
   Folder,
   FolderInput,
   FolderPlus,
+  Globe,
   GripVertical,
   LibraryBig,
-  ListChecks,
-  MessagesSquare,
-  NotebookPen,
+  ListTree,
+  MessageCircle,
   PanelLeftClose,
   PanelLeftOpen,
   PanelRightClose,
   PanelRightOpen,
   Pencil,
   Plus,
+  RotateCcw,
   Search,
   Settings2,
   Sparkles,
   Trash2,
+  Upload,
+  UserRound,
+  X,
 } from "lucide-react";
 import {
   Alert,
   Button,
   Dialog,
+  DirectoryToolbar,
   EmptyState,
   Input,
   Menu,
   MenuItem,
   MenuSeparator,
   MenuSub,
-  Select,
 } from "../components/ui";
-import { ApiError, errorText, remove, request } from "../lib/api";
+import { ApiError, errorText, remove, request, upload } from "../lib/api";
 import { useEvents } from "../lib/events";
 import {
+  bookSchema,
   chapterSchema,
+  entryFolderSchema,
   entrySchema,
   pendingSchema,
   searchSchema,
+  trashSchema,
   volumeSchema,
   type Book,
   type Chapter,
   type Entry,
+  type EntryFolder,
+  type EntryKind,
   type Volume,
 } from "../lib/schema";
 import { Editor, type DocumentValue, type EditorHandle } from "./Editor";
 import { PendingPanel } from "./PendingPanel";
 import { ChatPanel } from "./ChatPanel";
+import { RevisionDialog } from "./RevisionDialog";
 import "./workspace.css";
 
-export type AppRoute = "shelf" | "chapters" | "entries" | "discussion" | "pending";
+export type AppRoute =
+  | "shelf"
+  | "chapters"
+  | "characters"
+  | "world"
+  | "outline"
+  | "notes"
+  | "discussion"
+  | "pending"
+  | "trash";
 type BookRoute = Exclude<AppRoute, "shelf">;
+type EntryRoute = "characters" | "world" | "outline" | "notes";
+type EntrySortMode = "order" | "updated" | "title";
+type PendingSortMode = "newest" | "oldest";
 type Selection = { kind: "chapter" | "entry"; id: string };
-type EntryKind = Entry["kind"];
-type EntityForm =
-  | { kind: "volume"; id?: string; title: string }
-  | { kind: "chapter"; id?: string; title: string; volumeId: string }
-  | { kind: "entry"; id?: string; title: string; entryKind: EntryKind; category: string };
-type FolderPrompt = { entryId: string; category: string };
+type TrashTarget = { kind: "chapter" | "entry"; id: string; title: string };
+type GroupForm = {
+  target: "volume" | "folder";
+  id?: string;
+  entryKind?: EntryKind;
+  title: string;
+  description: string;
+};
+type RenameForm = {
+  target: "chapter" | "entry";
+  id: string;
+  title: string;
+};
+type FolderPrompt = { entryId: string; title: string };
 type WorkspaceData = {
   volumes: Volume[];
   chapters: Chapter[];
   entries: Entry[];
+  folders: EntryFolder[];
   changes: z.infer<typeof pendingSchema>[];
+  trashChapters: Chapter[];
+  trashEntries: Entry[];
 };
 
-const emptyData: WorkspaceData = { volumes: [], chapters: [], entries: [], changes: [] };
+const emptyData: WorkspaceData = {
+  volumes: [],
+  chapters: [],
+  entries: [],
+  folders: [],
+  changes: [],
+  trashChapters: [],
+  trashEntries: [],
+};
+
 const SIDEBAR_WIDTH_KEY = "inkwell:sidebar-width";
 const DEFAULT_SIDEBAR_WIDTH = 240;
 const MIN_SIDEBAR_WIDTH = 200;
 const MAX_SIDEBAR_WIDTH = 420;
+const COMPANION_WIDTH_KEY = "inkwell:companion-width";
+const DEFAULT_COMPANION_WIDTH = 380;
+const MIN_COMPANION_WIDTH = 300;
+const MAX_COMPANION_WIDTH = 560;
 
 function clampSidebarWidth(value: number): number {
   if (!Number.isFinite(value)) return DEFAULT_SIDEBAR_WIDTH;
   return Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, Math.round(value)));
 }
-const entryKinds: readonly { value: EntryKind; label: string }[] = [
-  { value: "character", label: "人物" },
-  { value: "world", label: "世界" },
-  { value: "note", label: "笔记" },
+
+function clampCompanionWidth(value: number): number {
+  if (!Number.isFinite(value)) return DEFAULT_COMPANION_WIDTH;
+  return Math.min(MAX_COMPANION_WIDTH, Math.max(MIN_COMPANION_WIDTH, Math.round(value)));
+}
+
+const entryRouteConfig: Record<
+  EntryRoute,
+  {
+    kind: EntryKind;
+    label: string;
+    itemLabel: string;
+    newTitle: string;
+    searchLabel: string;
+    searchPlaceholder: string;
+    emptyTitle: string;
+  }
+> = {
+  characters: {
+    kind: "character",
+    label: "角色",
+    itemLabel: "人物",
+    newTitle: "新人物",
+    searchLabel: "筛选角色",
+    searchPlaceholder: "筛选角色…",
+    emptyTitle: "暂无角色",
+  },
+  world: {
+    kind: "world",
+    label: "背景设定",
+    itemLabel: "条目",
+    newTitle: "新条目",
+    searchLabel: "筛选背景设定",
+    searchPlaceholder: "筛选背景设定…",
+    emptyTitle: "暂无背景设定",
+  },
+  outline: {
+    kind: "outline",
+    label: "提纲",
+    itemLabel: "提纲",
+    newTitle: "新提纲",
+    searchLabel: "筛选提纲",
+    searchPlaceholder: "筛选提纲…",
+    emptyTitle: "暂无提纲",
+  },
+  notes: {
+    kind: "note",
+    label: "笔记",
+    itemLabel: "笔记",
+    newTitle: "新笔记",
+    searchLabel: "筛选笔记",
+    searchPlaceholder: "筛选笔记…",
+    emptyTitle: "暂无笔记",
+  },
+};
+
+const entryKinds: readonly { value: EntryKind; label: string; route: EntryRoute }[] = [
+  { value: "character", label: "角色", route: "characters" },
+  { value: "world", label: "背景设定", route: "world" },
+  { value: "outline", label: "提纲", route: "outline" },
+  { value: "note", label: "笔记", route: "notes" },
 ];
+
+function isEntryRoute(route: AppRoute): route is EntryRoute {
+  return route === "characters" || route === "world" || route === "outline" || route === "notes";
+}
+
+function routeForEntryKind(kind: EntryKind): EntryRoute {
+  if (kind === "character") return "characters";
+  if (kind === "world") return "world";
+  if (kind === "outline") return "outline";
+  return "notes";
+}
+
+function entryKindLabel(kind: EntryKind): string {
+  return entryRouteConfig[routeForEntryKind(kind)].label;
+}
+
+function docIcon(kind: "chapter" | EntryKind, size = 12): ReactNode {
+  if (kind === "chapter") return <BookOpen size={size} />;
+  if (kind === "character") return <UserRound size={size} />;
+  if (kind === "world") return <Globe size={size} />;
+  if (kind === "outline") return <ListTree size={size} />;
+  return <FileText size={size} />;
+}
+
+function formatRelativeTime(iso: string): string {
+  if (!iso) return "";
+  const ts = Date.parse(iso);
+  if (!Number.isFinite(ts)) return "";
+  const diffMs = Date.now() - ts;
+  if (diffMs < 60_000) return "刚刚";
+  const mins = Math.floor(diffMs / 60_000);
+  if (mins < 60) return `${mins} 分钟前`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days} 天前`;
+  const months = Math.floor(days / 30);
+  if (months < 12) return `${months} 个月前`;
+  return new Date(ts).toLocaleDateString("zh-CN");
+}
+
+function sortEntriesList(items: Entry[], mode: EntrySortMode): Entry[] {
+  const list = [...items];
+  if (mode === "updated") {
+    list.sort((a, b) => (b.updated_at || b.created_at).localeCompare(a.updated_at || a.created_at));
+  } else if (mode === "title") {
+    list.sort((a, b) => a.title.localeCompare(b.title, "zh-CN"));
+  } else {
+    list.sort((a, b) => a.sort_order - b.sort_order);
+  }
+  return list;
+}
 
 export function Workspace({
   books,
@@ -133,6 +291,23 @@ export function Workspace({
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [selected, setSelected] = useState<Selection | null>(null);
+  const [autoFocusTarget, setAutoFocusTarget] = useState<Selection | null>(null);
+  const [openTabs, setOpenTabs] = useState<Selection[]>([]);
+  const [historyOpen, setHistoryOpen] = useState(false);
+
+  const [chapterFilter, setChapterFilter] = useState("");
+  const [entryFilter, setEntryFilter] = useState("");
+  const [pendingFilter, setPendingFilter] = useState("");
+  const [trashFilter, setTrashFilter] = useState("");
+  const [entrySort, setEntrySort] = useState<EntrySortMode>("order");
+  const [pendingSort, setPendingSort] = useState<PendingSortMode>("newest");
+  const [selectedTrash, setSelectedTrash] = useState<{
+    kind: "chapter" | "entry";
+    id: string;
+  } | null>(null);
+
+  const [importing, setImporting] = useState(false);
+  const importInputRef = useRef<HTMLInputElement | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
     try {
@@ -144,21 +319,35 @@ export function Workspace({
   });
   const [resizing, setResizing] = useState(false);
   const [companionOpen, setCompanionOpen] = useState(true);
+  const [companionWidth, setCompanionWidth] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem(COMPANION_WIDTH_KEY);
+      return saved ? clampCompanionWidth(Number(saved)) : DEFAULT_COMPANION_WIDTH;
+    } catch {
+      return DEFAULT_COMPANION_WIDTH;
+    }
+  });
+  const [resizingCompanion, setResizingCompanion] = useState(false);
   const [sessionSidebar, setSessionSidebar] = useState<HTMLDivElement | null>(null);
   const [focusPending, setFocusPending] = useState<string | null>(null);
-  const [form, setForm] = useState<EntityForm | null>(null);
+
+  const [groupForm, setGroupForm] = useState<GroupForm | null>(null);
+  const [renameForm, setRenameForm] = useState<RenameForm | null>(null);
   const [folderPrompt, setFolderPrompt] = useState<FolderPrompt | null>(null);
-  const [deletion, setDeletion] = useState<{ path: string; title: string; id: string } | null>(
-    null,
-  );
-  const [batchDeleteOpen, setBatchDeleteOpen] = useState(false);
-  const [batchMode, setBatchMode] = useState(false);
-  const [selectedEntryIds, setSelectedEntryIds] = useState<string[]>([]);
-  const [collapsedFolders, setCollapsedFolders] = useState<Record<string, boolean>>({});
+  const [deletion, setDeletion] = useState<{
+    path: string;
+    title: string;
+    id: string;
+    kind: "volume" | "folder" | "chapter" | "entry";
+  } | null>(null);
+  const [trashConfirm, setTrashConfirm] = useState<TrashTarget | "empty" | null>(null);
+
+  const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
   const [dragItem, setDragItem] = useState<{ kind: "chapter" | "entry"; id: string } | null>(null);
   const [dropTarget, setDropTarget] = useState<string | null>(null);
   const editor = useRef<EditorHandle>(null);
   const [pendingNavigation, setPendingNavigation] = useState<(() => void) | null>(null);
+
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<z.infer<typeof searchSchema>[]>([]);
   const [searching, setSearching] = useState(false);
@@ -183,8 +372,14 @@ export function Workspace({
 
   useEffect(() => {
     setSelected(null);
-    setBatchMode(false);
-    setSelectedEntryIds([]);
+    setAutoFocusTarget(null);
+    setOpenTabs([]);
+    setHistoryOpen(false);
+    setChapterFilter("");
+    setEntryFilter("");
+    setPendingFilter("");
+    setTrashFilter("");
+    setSelectedTrash(null);
     setError("");
     if (!bookId) {
       setData(emptyData);
@@ -205,23 +400,47 @@ export function Workspace({
       }
       running = true;
       try {
-        const [volumes, chapters, entries, changes] = await Promise.all([
+        const [volumes, chapters, entries, folders, changes, trash] = await Promise.all([
           request(`/books/${currentBookId}/volumes`, z.array(volumeSchema)),
           request(`/books/${currentBookId}/chapters`, z.array(chapterSchema)),
           request(`/books/${currentBookId}/entries`, z.array(entrySchema)),
+          request(`/books/${currentBookId}/folders`, z.array(entryFolderSchema)),
           request(`/books/${currentBookId}/pending-changes?status=pending`, z.array(pendingSchema)),
+          request(`/books/${currentBookId}/trash`, trashSchema),
         ]);
         if (disposed) return;
         volumes.sort((a, b) => a.sort_order - b.sort_order);
         chapters.sort((a, b) => a.sort_order - b.sort_order);
         entries.sort((a, b) => a.sort_order - b.sort_order);
-        setData({ volumes, chapters, entries, changes });
+        folders.sort((a, b) => a.sort_order - b.sort_order);
+        setData({
+          volumes,
+          chapters,
+          entries,
+          folders,
+          changes,
+          trashChapters: trash.chapters,
+          trashEntries: trash.entries,
+        });
         setLoadedBookId(currentBookId);
+        setOpenTabs((current) =>
+          current.filter((tab) =>
+            tab.kind === "chapter"
+              ? chapters.some((c) => c.id === tab.id)
+              : entries.some((e) => e.id === tab.id),
+          ),
+        );
         if (!initialized) {
           initialized = true;
-          if (routeRef.current === "entries") {
-            const firstEntry = entries[0];
-            if (firstEntry) setSelected((cur) => cur ?? { kind: "entry", id: firstEntry.id });
+          const activeRoute = routeRef.current;
+          if (isEntryRoute(activeRoute)) {
+            const targetKind = entryRouteConfig[activeRoute].kind;
+            const firstEntry = entries.find((item) => item.kind === targetKind);
+            if (firstEntry) {
+              const initial: Selection = { kind: "entry", id: firstEntry.id };
+              setSelected((cur) => cur ?? initial);
+              setOpenTabs((cur) => (cur.length > 0 ? cur : [initial]));
+            }
           } else {
             let lastId: string | null = null;
             try {
@@ -231,11 +450,16 @@ export function Workspace({
             }
             const first =
               chapters.find((item) => item.id === lastId) ??
+              chapters.find((item) => item.volume_id === null) ??
               volumes.flatMap((volume) =>
                 chapters.filter((item) => item.volume_id === volume.id),
               )[0] ??
               chapters[0];
-            if (first) setSelected((cur) => cur ?? { kind: "chapter", id: first.id });
+            if (first) {
+              const initial: Selection = { kind: "chapter", id: first.id };
+              setSelected((cur) => cur ?? initial);
+              setOpenTabs((cur) => (cur.length > 0 ? cur : [initial]));
+            }
           }
         }
       } catch (failure) {
@@ -317,16 +541,69 @@ export function Workspace({
     else action();
   }
 
-  function choose(selection: Selection) {
-    const targetRoute: BookRoute = selection.kind === "chapter" ? "chapters" : "entries";
+  function targetRouteFor(selection: Selection): BookRoute {
+    if (selection.kind === "chapter") return "chapters";
+    const found = data.entries.find((item) => item.id === selection.id);
+    return found ? routeForEntryKind(found.kind) : "notes";
+  }
+
+  function choose(selection: Selection, explicitRoute?: BookRoute) {
+    const targetRoute = explicitRoute ?? targetRouteFor(selection);
+    setOpenTabs((prev) =>
+      prev.some((tab) => tab.kind === selection.kind && tab.id === selection.id)
+        ? prev
+        : [...prev, selection],
+    );
     if (selected?.id === selection.id && selected.kind === selection.kind) {
       onRouteChange(targetRoute);
       return;
     }
     navigate(() => {
+      setAutoFocusTarget(null);
       setSelected(selection);
       onRouteChange(targetRoute);
     });
+  }
+
+  function closeTab(tab: Selection) {
+    const isCurrent = selected?.kind === tab.kind && selected.id === tab.id;
+    if (!isCurrent) {
+      setOpenTabs((prev) => prev.filter((item) => !(item.kind === tab.kind && item.id === tab.id)));
+      return;
+    }
+    navigate(() => {
+      const idx = openTabs.findIndex((item) => item.kind === tab.kind && item.id === tab.id);
+      const remaining = openTabs.filter((item) => !(item.kind === tab.kind && item.id === tab.id));
+      setOpenTabs(remaining);
+      const next = remaining[idx] ?? remaining[idx - 1] ?? null;
+      setAutoFocusTarget(null);
+      setSelected(next);
+      if (next) {
+        onRouteChange(targetRouteFor(next));
+      }
+    });
+  }
+
+  function downloadBook(id: string, format: "zip" | "md" | "txt") {
+    const link = document.createElement("a");
+    link.href = `/api/books/${id}/export?format=${format}`;
+    link.download = "";
+    link.click();
+  }
+
+  async function importZipBook(file: File | undefined) {
+    if (!file) return;
+    setImporting(true);
+    setError("");
+    try {
+      const imported = await upload("/books/import", bookSchema, file, "POST", "application/zip");
+      onRefreshBooks();
+      onOpenBook(imported);
+    } catch (failure) {
+      setError(errorText(failure));
+    } finally {
+      setImporting(false);
+    }
   }
 
   function switchRoute(next: AppRoute) {
@@ -336,29 +613,45 @@ export function Workspace({
     }
     if (!bookId) return;
     setSidebarCollapsed(false);
-    if (next !== "entries") {
-      setBatchMode(false);
-      setSelectedEntryIds([]);
-    }
-    if (next === "chapters" && selected?.kind !== "chapter") {
-      const firstChapter = data.chapters[0];
-      if (firstChapter) choose({ kind: "chapter", id: firstChapter.id });
+    if (next === "chapters") {
+      if (selected?.kind === "chapter") {
+        onRouteChange("chapters");
+        return;
+      }
+      const firstChapter =
+        data.chapters.find((c) => c.volume_id === null) ??
+        data.volumes.flatMap((v) => data.chapters.filter((c) => c.volume_id === v.id))[0] ??
+        data.chapters[0];
+      if (firstChapter) choose({ kind: "chapter", id: firstChapter.id }, "chapters");
       else
         navigate(() => {
+          setAutoFocusTarget(null);
           setSelected(null);
           onRouteChange("chapters");
         });
-    } else if (next === "entries" && selected?.kind !== "entry") {
-      const firstEntry = data.entries[0];
-      if (firstEntry) choose({ kind: "entry", id: firstEntry.id });
+      return;
+    }
+    if (isEntryRoute(next)) {
+      const targetKind = entryRouteConfig[next].kind;
+      const currentEntry =
+        selected?.kind === "entry" ? data.entries.find((e) => e.id === selected.id) : undefined;
+      if (currentEntry && currentEntry.kind === targetKind) {
+        onRouteChange(next);
+        return;
+      }
+      const firstEntry =
+        data.entries.find((item) => item.kind === targetKind && !item.category.trim()) ??
+        data.entries.find((item) => item.kind === targetKind);
+      if (firstEntry) choose({ kind: "entry", id: firstEntry.id }, next);
       else
         navigate(() => {
+          setAutoFocusTarget(null);
           setSelected(null);
-          onRouteChange("entries");
+          onRouteChange(next);
         });
-    } else {
-      onRouteChange(next);
+      return;
     }
+    navigate(() => onRouteChange(next));
   }
 
   async function mutate(action: () => Promise<unknown>) {
@@ -376,58 +669,162 @@ export function Workspace({
     }
   }
 
-  function newForm(
-    kind: EntityForm["kind"],
-    volumeId = "none",
-    entryKind: EntryKind = "character",
-  ) {
-    setError("");
-    if (kind === "volume") setForm({ kind: "volume", title: "" });
-    else if (kind === "chapter") setForm({ kind: "chapter", title: "", volumeId });
-    else setForm({ kind: "entry", title: "", entryKind, category: "" });
+  function createChapterDirect(volumeId: string | null = null) {
+    if (!bookId || busy) return;
+    navigate(() => {
+      void (async () => {
+        const siblings = data.chapters.filter((item) => item.volume_id === volumeId);
+        const sortOrder =
+          volumeId === null
+            ? siblings.length > 0
+              ? Math.min(...siblings.map((c) => c.sort_order)) - 1
+              : 0
+            : siblings.length > 0
+              ? Math.max(...siblings.map((c) => c.sort_order)) + 1
+              : 0;
+        setBusy(true);
+        setError("");
+        try {
+          const created = await request(`/books/${bookId}/chapters`, chapterSchema, {
+            method: "POST",
+            body: { title: "新章节", volume_id: volumeId, sort_order: sortOrder },
+          });
+          if (volumeId) {
+            setCollapsedGroups((cur) => ({ ...cur, [`volume:${volumeId}`]: false }));
+          }
+          setData((cur) => ({
+            ...cur,
+            chapters: [...cur.chapters, created].sort((a, b) => a.sort_order - b.sort_order),
+          }));
+          const nextSel: Selection = { kind: "chapter", id: created.id };
+          setOpenTabs((prev) =>
+            prev.some((tab) => tab.kind === nextSel.kind && tab.id === nextSel.id)
+              ? prev
+              : [...prev, nextSel],
+          );
+          setSelected(nextSel);
+          setAutoFocusTarget(nextSel);
+          onRouteChange("chapters");
+          refresh();
+        } catch (failure) {
+          setError(errorText(failure));
+        } finally {
+          setBusy(false);
+        }
+      })();
+    });
   }
 
-  async function submitForm() {
-    if (!form || !form.title.trim() || !bookId) return;
-    const snapshot = form;
-    const path =
-      snapshot.kind === "volume" ? "volumes" : snapshot.kind === "chapter" ? "chapters" : "entries";
-    const body =
-      snapshot.kind === "volume"
-        ? {
-            title: snapshot.title.trim(),
-            sort_order: snapshot.id ? undefined : data.volumes.length,
+  function createEntryDirect(kind: EntryKind, category = "") {
+    if (!bookId || busy) return;
+    const cleanCat = category.trim();
+    const targetRoute = routeForEntryKind(kind);
+    const cfg = entryRouteConfig[targetRoute];
+    navigate(() => {
+      void (async () => {
+        const siblings = data.entries.filter(
+          (item) => item.kind === kind && item.category.trim() === cleanCat,
+        );
+        const sortOrder =
+          cleanCat === ""
+            ? siblings.length > 0
+              ? Math.min(...siblings.map((e) => e.sort_order)) - 1
+              : 0
+            : siblings.length > 0
+              ? Math.max(...siblings.map((e) => e.sort_order)) + 1
+              : 0;
+        setBusy(true);
+        setError("");
+        try {
+          const created = await request(`/books/${bookId}/entries`, entrySchema, {
+            method: "POST",
+            body: {
+              title: cfg.newTitle,
+              kind,
+              category: cleanCat,
+              visibility: "local",
+              sort_order: sortOrder,
+            },
+          });
+          if (cleanCat) {
+            setCollapsedGroups((cur) => ({ ...cur, [`folder:${kind}:${cleanCat}`]: false }));
           }
-        : snapshot.kind === "chapter"
-          ? {
-              title: snapshot.title.trim(),
-              ...(snapshot.id
-                ? {}
-                : {
-                    volume_id: snapshot.volumeId === "none" ? null : snapshot.volumeId,
-                    sort_order: data.chapters.length,
-                  }),
-            }
-          : {
-              title: snapshot.title.trim(),
-              ...(snapshot.id
-                ? {}
-                : {
-                    kind: snapshot.entryKind,
-                    category: snapshot.category.trim(),
-                    visibility: "local",
-                    sort_order: data.entries.length,
-                  }),
-            };
-    const result = await mutate(async () => {
-      const url = snapshot.id ? `/${path}/${snapshot.id}` : `/books/${bookId}/${path}`;
-      const schema = z.object({ id: z.string() });
-      const item = await request(url, schema, { method: snapshot.id ? "PATCH" : "POST", body });
-      if (!snapshot.id && snapshot.kind !== "volume") {
-        choose({ kind: snapshot.kind, id: item.id });
+          setData((cur) => ({
+            ...cur,
+            entries: [...cur.entries, created].sort((a, b) => a.sort_order - b.sort_order),
+          }));
+          const nextSel: Selection = { kind: "entry", id: created.id };
+          setOpenTabs((prev) =>
+            prev.some((tab) => tab.kind === nextSel.kind && tab.id === nextSel.id)
+              ? prev
+              : [...prev, nextSel],
+          );
+          setSelected(nextSel);
+          setAutoFocusTarget(nextSel);
+          onRouteChange(targetRoute);
+          refresh();
+        } catch (failure) {
+          setError(errorText(failure));
+        } finally {
+          setBusy(false);
+        }
+      })();
+    });
+  }
+
+  async function submitGroupForm() {
+    if (!groupForm || !groupForm.title.trim() || !bookId) return;
+    const snapshot = groupForm;
+    const ok = await mutate(async () => {
+      if (snapshot.target === "volume") {
+        const url = snapshot.id ? `/volumes/${snapshot.id}` : `/books/${bookId}/volumes`;
+        await request(url, volumeSchema, {
+          method: snapshot.id ? "PATCH" : "POST",
+          body: {
+            title: snapshot.title.trim(),
+            description: snapshot.description.trim(),
+            ...(snapshot.id ? {} : { sort_order: data.volumes.length }),
+          },
+        });
+      } else {
+        const kind = snapshot.entryKind ?? "note";
+        const url = snapshot.id ? `/folders/${snapshot.id}` : `/books/${bookId}/folders`;
+        await request(url, entryFolderSchema, {
+          method: snapshot.id ? "PATCH" : "POST",
+          body: snapshot.id
+            ? {
+                title: snapshot.title.trim(),
+                description: snapshot.description.trim(),
+              }
+            : {
+                kind,
+                title: snapshot.title.trim(),
+                description: snapshot.description.trim(),
+                sort_order: data.folders.filter((f) => f.kind === kind).length,
+              },
+        });
       }
     });
-    if (result) setForm(null);
+    if (ok) setGroupForm(null);
+  }
+
+  async function submitRenameForm() {
+    if (!renameForm || !renameForm.title.trim()) return;
+    const snapshot = renameForm;
+    const ok = await mutate(async () => {
+      if (snapshot.target === "chapter") {
+        await request(`/chapters/${snapshot.id}`, chapterSchema, {
+          method: "PATCH",
+          body: { title: snapshot.title.trim() },
+        });
+      } else {
+        await request(`/entries/${snapshot.id}`, entrySchema, {
+          method: "PATCH",
+          body: { title: snapshot.title.trim() },
+        });
+      }
+    });
+    if (ok) setRenameForm(null);
   }
 
   async function reorderVolumes(id: string, direction: number) {
@@ -444,7 +841,30 @@ export function Workspace({
     await mutate(() =>
       Promise.all(
         next.map((item, order) =>
-          request(`/volumes/${item.id}`, z.object({ id: z.string() }), {
+          request(`/volumes/${item.id}`, volumeSchema, {
+            method: "PATCH",
+            body: { sort_order: order },
+          }),
+        ),
+      ),
+    );
+  }
+
+  async function reorderFolders(kind: EntryKind, id: string, direction: number) {
+    const items = data.folders.filter((f) => f.kind === kind);
+    const index = items.findIndex((item) => item.id === id);
+    const target = index + direction;
+    if (target < 0 || target >= items.length) return;
+    const next = [...items];
+    const current = next[index];
+    const other = next[target];
+    if (!current || !other) return;
+    next[index] = other;
+    next[target] = current;
+    await mutate(() =>
+      Promise.all(
+        next.map((item, order) =>
+          request(`/folders/${item.id}`, entryFolderSchema, {
             method: "PATCH",
             body: { sort_order: order },
           }),
@@ -544,65 +964,33 @@ export function Workspace({
     );
   }
 
-  async function applyBatchVisibility(visibility: "local" | "global") {
-    if (selectedEntryIds.length === 0) return;
-    const ids = [...selectedEntryIds];
+  async function restoreTrashItem(target: TrashTarget) {
+    if (!bookId) return;
     const ok = await mutate(() =>
-      Promise.all(
-        ids.map((id) =>
-          request(`/entries/${id}`, entrySchema, { method: "PATCH", body: { visibility } }),
-        ),
-      ),
+      request(`/books/${bookId}/trash/restore`, z.union([chapterSchema, entrySchema]), {
+        method: "POST",
+        body: { target_type: target.kind, target_id: target.id },
+      }),
     );
-    if (ok) {
-      setSelectedEntryIds([]);
-      setBatchMode(false);
+    if (ok && selectedTrash?.kind === target.kind && selectedTrash.id === target.id) {
+      setSelectedTrash(null);
     }
   }
 
-  async function applyBatchMove(nextKind: EntryKind, nextCategory: string) {
-    if (selectedEntryIds.length === 0) return;
-    const ids = [...selectedEntryIds];
-    const cleanCategory = nextCategory.trim();
-    const ok = await mutate(() =>
-      Promise.all(
-        ids.map((id) =>
-          request(`/entries/${id}`, entrySchema, {
-            method: "PATCH",
-            body: { kind: nextKind, category: cleanCategory },
-          }),
-        ),
-      ),
-    );
-    if (ok) {
-      setSelectedEntryIds([]);
-      setBatchMode(false);
-    }
-  }
-
-  async function applyBatchDelete() {
-    if (selectedEntryIds.length === 0) return;
-    const ids = [...selectedEntryIds];
+  async function confirmPurgeTrash() {
+    if (!bookId || !trashConfirm) return;
     const ok = await mutate(async () => {
-      for (const id of ids) {
-        if (editor.current?.dirty && selected?.id === id && !editor.current.stash()) {
-          throw new Error("请先保存当前草稿。");
+      if (trashConfirm === "empty") {
+        await remove(`/books/${bookId}/trash`);
+        setSelectedTrash(null);
+      } else {
+        await remove(`/books/${bookId}/trash/${trashConfirm.kind}/${trashConfirm.id}`);
+        if (selectedTrash?.kind === trashConfirm.kind && selectedTrash.id === trashConfirm.id) {
+          setSelectedTrash(null);
         }
-        await remove(`/entries/${id}`);
       }
-      if (selected && ids.includes(selected.id)) setSelected(null);
     });
-    if (ok) {
-      setBatchDeleteOpen(false);
-      setSelectedEntryIds([]);
-      setBatchMode(false);
-    }
-  }
-
-  function toggleEntrySelection(id: string) {
-    setSelectedEntryIds((current) =>
-      current.includes(id) ? current.filter((item) => item !== id) : [...current, id],
-    );
+    if (ok) setTrashConfirm(null);
   }
 
   const loaded = bookId !== null && loadedBookId === bookId;
@@ -643,23 +1031,14 @@ export function Workspace({
     }
   }
 
-  function categoriesFor(kind: EntryKind) {
-    return Array.from(
-      new Set(
-        data.entries
-          .filter((item) => item.kind === kind)
-          .map((item) => item.category.trim())
-          .filter(Boolean),
-      ),
-    );
-  }
-
   function renderChapterRow(item: Chapter) {
     const dropKey = `chapter:${item.id}`;
+    const isSelected = selected?.kind === "chapter" && selected.id === item.id;
+    const relTime = formatRelativeTime(item.updated_at || item.created_at);
     return (
       <div
         key={item.id}
-        className={`directory-row ${selected?.id === item.id ? "is-selected" : ""} ${dropTarget === dropKey ? "is-drop-target" : ""}`}
+        className={`directory-row ${isSelected ? "is-selected" : ""} ${dropTarget === dropKey ? "is-drop-target" : ""}`}
         draggable
         onDragStart={(event) => {
           event.dataTransfer.effectAllowed = "move";
@@ -688,14 +1067,21 @@ export function Workspace({
         <span className="directory-drag-handle" aria-hidden="true">
           <GripVertical size={13} />
         </span>
-        <Button
-          variant="ghost"
-          className="directory-title"
-          onClick={() => choose({ kind: "chapter", id: item.id })}
+        <button
+          type="button"
+          className="directory-row-trigger"
+          onClick={() => choose({ kind: "chapter", id: item.id }, "chapters")}
         >
-          <span>{item.title}</span>
-        </Button>
-        <div className="directory-actions">
+          <span className="directory-row-title">{item.title}</span>
+          <span className="directory-row-meta">
+            {item.word_count.toLocaleString("zh-CN")} 字{relTime ? ` · ${relTime}` : ""}
+          </span>
+        </button>
+        <div
+          className="directory-actions"
+          onClick={(event) => event.stopPropagation()}
+          onKeyDown={(event) => event.stopPropagation()}
+        >
           <Menu label={`${item.title}的操作`} iconOnly>
             <MenuSub label="移动到分卷" icon={<FolderInput size={14} />}>
               <MenuItem onSelect={() => void moveChapterToVolume(item, null)}>
@@ -719,16 +1105,7 @@ export function Workspace({
               ))}
             </MenuSub>
             <MenuItem
-              onSelect={() =>
-                navigate(() =>
-                  setForm({
-                    kind: "chapter",
-                    id: item.id,
-                    title: item.title,
-                    volumeId: item.volume_id ?? "none",
-                  }),
-                )
-              }
+              onSelect={() => setRenameForm({ target: "chapter", id: item.id, title: item.title })}
             >
               <Pencil size={14} />
               重命名
@@ -737,7 +1114,12 @@ export function Workspace({
             <MenuItem
               danger
               onSelect={() =>
-                setDeletion({ path: `/chapters/${item.id}`, title: item.title, id: item.id })
+                setDeletion({
+                  path: `/chapters/${item.id}`,
+                  title: item.title,
+                  id: item.id,
+                  kind: "chapter",
+                })
               }
             >
               <Trash2 size={14} />
@@ -750,20 +1132,22 @@ export function Workspace({
   }
 
   function renderEntryRow(item: Entry) {
-    const checked = selectedEntryIds.includes(item.id);
     const dropKey = `entry:${item.id}`;
-    const foldersInKind = categoriesFor(item.kind);
+    const isSelected = selected?.kind === "entry" && selected.id === item.id;
+    const foldersInKind = data.folders.filter((f) => f.kind === item.kind);
+    const relTime = formatRelativeTime(item.updated_at || item.created_at);
     return (
       <div
-        className={`directory-row ${selected?.id === item.id ? "is-selected" : ""} ${dropTarget === dropKey ? "is-drop-target" : ""}`}
+        className={`directory-row ${isSelected ? "is-selected" : ""} ${dropTarget === dropKey ? "is-drop-target" : ""}`}
         key={item.id}
-        draggable={!batchMode}
+        draggable={entrySort === "order"}
         onDragStart={(event) => {
+          if (entrySort !== "order") return;
           event.dataTransfer.effectAllowed = "move";
           setDragItem({ kind: "entry", id: item.id });
         }}
         onDragOver={(event) => {
-          if (dragItem?.kind === "entry" && dragItem.id !== item.id) {
+          if (entrySort === "order" && dragItem?.kind === "entry" && dragItem.id !== item.id) {
             event.preventDefault();
             setDropTarget(dropKey);
           }
@@ -774,7 +1158,9 @@ export function Workspace({
         onDrop={(event) => {
           event.preventDefault();
           setDropTarget(null);
-          if (dragItem?.kind === "entry") void dropEntryOnEntry(dragItem.id, item);
+          if (entrySort === "order" && dragItem?.kind === "entry") {
+            void dropEntryOnEntry(dragItem.id, item);
+          }
           setDragItem(null);
         }}
         onDragEnd={() => {
@@ -782,131 +1168,161 @@ export function Workspace({
           setDropTarget(null);
         }}
       >
-        {batchMode ? (
-          <label className="directory-check">
-            <input
-              type="checkbox"
-              checked={checked}
-              aria-label={`选择 ${item.title}`}
-              onChange={() => toggleEntrySelection(item.id)}
-            />
-          </label>
-        ) : (
-          <span className="directory-drag-handle" aria-hidden="true">
-            <GripVertical size={13} />
-          </span>
-        )}
-        <Button
-          variant="ghost"
-          className="directory-title"
+        <span
+          className={`directory-drag-handle ${entrySort !== "order" ? "is-disabled" : ""}`}
+          aria-hidden="true"
+        >
+          <GripVertical size={13} />
+        </span>
+        <button
+          type="button"
+          className="directory-row-trigger"
+          onClick={() => choose({ kind: "entry", id: item.id })}
+        >
+          <span className="directory-row-title">{item.title}</span>
+          {relTime && <span className="directory-row-meta">{relTime}</span>}
+        </button>
+        <button
+          type="button"
+          className={`entry-vis-btn ${item.visibility === "global" ? "is-global" : "is-local"}`}
+          disabled={busy}
+          title={
+            item.visibility === "global"
+              ? "仅全局资料会话可见，点击改为公开"
+              : "所有会话可见，点击改为仅全局"
+          }
+          aria-label={`${item.title} 可见性：${item.visibility === "global" ? "仅全局" : "公开"}`}
           onClick={(event) => {
-            if (event.ctrlKey || event.metaKey) {
-              setBatchMode(true);
-              toggleEntrySelection(item.id);
-            } else if (batchMode) {
-              toggleEntrySelection(item.id);
-            } else {
-              choose({ kind: "entry", id: item.id });
-            }
+            event.stopPropagation();
+            void toggleEntryVisibility(item);
           }}
         >
-          <span>{item.title}</span>
-        </Button>
-        {!batchMode && (
-          <>
-            <button
-              type="button"
-              className={`entry-vis-btn ${item.visibility === "global" ? "is-global" : "is-local"}`}
-              disabled={busy}
-              title={
-                item.visibility === "global"
-                  ? "仅全局资料会话可见，点击改为公开"
-                  : "所有会话可见，点击改为仅全局"
-              }
-              aria-label={`${item.title} 可见性：${item.visibility === "global" ? "仅全局" : "公开"}`}
-              onClick={(event) => {
-                event.stopPropagation();
-                void toggleEntryVisibility(item);
-              }}
-            >
-              {item.visibility === "global" ? <Sparkles size={11} /> : <Eye size={11} />}
-              <span>{item.visibility === "global" ? "仅全局" : "公开"}</span>
-            </button>
-            <div className="directory-actions">
-              <Menu label={`${item.title}的操作`} iconOnly>
-                <MenuSub label="移动到…" icon={<FolderInput size={14} />}>
-                  {foldersInKind.map((folderName) => (
-                    <MenuItem
-                      key={folderName}
-                      onSelect={() => void moveEntry(item, item.kind, folderName)}
-                    >
-                      <Check
-                        size={13}
-                        className={
-                          item.category.trim() === folderName ? "opacity-100" : "opacity-0"
-                        }
-                      />
-                      {folderName}
-                    </MenuItem>
-                  ))}
-                  {item.category.trim() && (
-                    <MenuItem onSelect={() => void moveEntry(item, item.kind, "")}>
-                      <Folder size={13} />
-                      移出文件夹
-                    </MenuItem>
-                  )}
-                  <MenuSeparator />
-                  <MenuItem onSelect={() => setFolderPrompt({ entryId: item.id, category: "" })}>
-                    <FolderPlus size={13} />
-                    新建文件夹…
+          {item.visibility === "global" ? <Sparkles size={11} /> : <Eye size={11} />}
+          <span>{item.visibility === "global" ? "仅全局" : "公开"}</span>
+        </button>
+        <div
+          className="directory-actions"
+          onClick={(event) => event.stopPropagation()}
+          onKeyDown={(event) => event.stopPropagation()}
+        >
+          <Menu label={`${item.title}的操作`} iconOnly>
+            <MenuSub label="移动到…" icon={<FolderInput size={14} />}>
+              {foldersInKind.map((folder) => (
+                <MenuItem
+                  key={folder.id}
+                  onSelect={() => void moveEntry(item, item.kind, folder.title)}
+                >
+                  <Check
+                    size={13}
+                    className={item.category.trim() === folder.title ? "opacity-100" : "opacity-0"}
+                  />
+                  {folder.title}
+                </MenuItem>
+              ))}
+              {item.category.trim() && (
+                <MenuItem onSelect={() => void moveEntry(item, item.kind, "")}>
+                  <Folder size={13} />
+                  移出文件夹
+                </MenuItem>
+              )}
+              <MenuSeparator />
+              <MenuItem onSelect={() => setFolderPrompt({ entryId: item.id, title: "" })}>
+                <FolderPlus size={13} />
+                新建文件夹…
+              </MenuItem>
+              <MenuSeparator />
+              {entryKinds
+                .filter((option) => option.value !== item.kind)
+                .map((option) => (
+                  <MenuItem
+                    key={option.value}
+                    onSelect={() => void moveEntry(item, option.value, "")}
+                  >
+                    移至{option.label}
                   </MenuItem>
-                  <MenuSeparator />
-                  {entryKinds
-                    .filter((option) => option.value !== item.kind)
-                    .map((option) => (
-                      <MenuItem
-                        key={option.value}
-                        onSelect={() => void moveEntry(item, option.value, "")}
-                      >
-                        移至{option.label}
-                      </MenuItem>
-                    ))}
-                </MenuSub>
-                <MenuItem
-                  onSelect={() =>
-                    setForm({
-                      kind: "entry",
-                      id: item.id,
-                      title: item.title,
-                      entryKind: item.kind,
-                      category: item.category,
-                    })
-                  }
-                >
-                  <Pencil size={14} />
-                  重命名
-                </MenuItem>
-                <MenuSeparator />
-                <MenuItem
-                  danger
-                  onSelect={() =>
-                    setDeletion({ path: `/entries/${item.id}`, title: item.title, id: item.id })
-                  }
-                >
-                  <Trash2 size={14} />
-                  删除
-                </MenuItem>
-              </Menu>
-            </div>
-          </>
-        )}
+                ))}
+            </MenuSub>
+            <MenuItem
+              onSelect={() => setRenameForm({ target: "entry", id: item.id, title: item.title })}
+            >
+              <Pencil size={14} />
+              重命名
+            </MenuItem>
+            <MenuSeparator />
+            <MenuItem
+              danger
+              onSelect={() =>
+                setDeletion({
+                  path: `/entries/${item.id}`,
+                  title: item.title,
+                  id: item.id,
+                  kind: "entry",
+                })
+              }
+            >
+              <Trash2 size={14} />
+              删除
+            </MenuItem>
+          </Menu>
+        </div>
       </div>
     );
   }
 
+  const visiblePending = useMemo(() => {
+    const q = pendingFilter.trim().toLowerCase();
+    const filtered = data.changes.filter(
+      (change) =>
+        !q ||
+        change.title.toLowerCase().includes(q) ||
+        change.after_content.toLowerCase().includes(q),
+    );
+    filtered.sort((a, b) => {
+      const ta = a.created_at ?? "";
+      const tb = b.created_at ?? "";
+      return pendingSort === "newest" ? tb.localeCompare(ta) : ta.localeCompare(tb);
+    });
+    return filtered;
+  }, [data.changes, pendingFilter, pendingSort]);
+
   const currentPending =
-    data.changes.find((change) => change.id === focusPending) ?? data.changes[0];
-  const editing = route === "chapters" || route === "entries";
+    visiblePending.find((change) => change.id === focusPending) ?? visiblePending[0];
+
+  const trashItems = useMemo(() => {
+    const combined = [
+      ...data.trashChapters.map((c) => ({
+        kind: "chapter" as const,
+        id: c.id,
+        title: c.title,
+        content: c.content,
+        kindLabel: "章节",
+        deletedAt: c.deleted_at ?? c.updated_at,
+      })),
+      ...data.trashEntries.map((e) => ({
+        kind: "entry" as const,
+        id: e.id,
+        title: e.title,
+        content: e.content,
+        kindLabel: entryKindLabel(e.kind),
+        deletedAt: e.deleted_at ?? e.updated_at,
+      })),
+    ];
+    combined.sort((a, b) => b.deletedAt.localeCompare(a.deletedAt));
+    const q = trashFilter.trim().toLowerCase();
+    return q
+      ? combined.filter(
+          (item) => item.title.toLowerCase().includes(q) || item.content.toLowerCase().includes(q),
+        )
+      : combined;
+  }, [data.trashChapters, data.trashEntries, trashFilter]);
+
+  const activeTrashItem =
+    trashItems.find((item) => item.kind === selectedTrash?.kind && item.id === selectedTrash.id) ??
+    trashItems[0] ??
+    null;
+
+  const trashTotalCount = data.trashChapters.length + data.trashEntries.length;
+  const editing = route === "chapters" || isEntryRoute(route);
   const sidebarClosed = route === "shelf" || sidebarCollapsed;
 
   const sidebarToggle = (
@@ -969,9 +1385,320 @@ export function Workspace({
     [sidebarClosed, sidebarWidth, updateSidebarWidth],
   );
 
+  const updateCompanionWidth = useCallback((nextWidth: number) => {
+    const clamped = clampCompanionWidth(nextWidth);
+    setCompanionWidth(clamped);
+    try {
+      localStorage.setItem(COMPANION_WIDTH_KEY, String(clamped));
+    } catch {
+      /* Optional preference. */
+    }
+    return clamped;
+  }, []);
+
+  const startCompanionResize = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      if (!(editing && companionOpen)) return;
+      event.preventDefault();
+      const startX = event.clientX;
+      const startWidth = companionWidth;
+      let latestWidth = startWidth;
+      setResizingCompanion(true);
+
+      const onMove = (moveEvent: PointerEvent) => {
+        latestWidth = clampCompanionWidth(startWidth + (startX - moveEvent.clientX));
+        setCompanionWidth(latestWidth);
+      };
+      const onUp = () => {
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+        setResizingCompanion(false);
+        updateCompanionWidth(latestWidth);
+      };
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
+    },
+    [editing, companionOpen, companionWidth, updateCompanionWidth],
+  );
+
+  useEffect(() => {
+    function checkViewport() {
+      if (route === "shelf") return;
+      if (window.innerWidth < 820 || (editing && companionOpen && window.innerWidth < 1140)) {
+        setSidebarCollapsed(true);
+      }
+    }
+    checkViewport();
+    window.addEventListener("resize", checkViewport);
+    return () => window.removeEventListener("resize", checkViewport);
+  }, [route, editing, companionOpen]);
+
+  function renderEntryDirectory(activeRoute: EntryRoute) {
+    const cfg = entryRouteConfig[activeRoute];
+    const kind = cfg.kind;
+    const q = entryFilter.trim().toLowerCase();
+    const kindFolders = data.folders.filter((f) => f.kind === kind);
+    const kindEntries = data.entries.filter((e) => e.kind === kind);
+
+    const matchesQuery = (item: Entry) =>
+      !q || item.title.toLowerCase().includes(q) || item.category.toLowerCase().includes(q);
+
+    const uncategorized = sortEntriesList(
+      kindEntries.filter((item) => !item.category.trim() && matchesQuery(item)),
+      entrySort,
+    );
+
+    const folderBuckets = kindFolders.map((folder) => {
+      const folderMatches = !q || folder.title.toLowerCase().includes(q);
+      const items = sortEntriesList(
+        kindEntries.filter(
+          (item) => item.category.trim() === folder.title && (folderMatches || matchesQuery(item)),
+        ),
+        entrySort,
+      );
+      return { folder, items, visible: !q || folderMatches || items.length > 0 };
+    });
+
+    const uncategorizedDropKey = `uncategorized:${kind}`;
+
+    return (
+      <>
+        <DirectoryToolbar
+          searchValue={entryFilter}
+          onSearchChange={setEntryFilter}
+          searchLabel={cfg.searchLabel}
+          searchPlaceholder={cfg.searchPlaceholder}
+          create={
+            <Menu
+              label={`新建${cfg.label}`}
+              iconOnly
+              icon={<Plus size={15} />}
+              triggerClassName="icon-control"
+            >
+              <MenuItem onSelect={() => createEntryDirect(kind, "")}>
+                <FilePlus2 size={14} />
+                新建{cfg.itemLabel}
+              </MenuItem>
+              <MenuItem
+                onSelect={() =>
+                  setGroupForm({
+                    target: "folder",
+                    entryKind: kind,
+                    title: "",
+                    description: "",
+                  })
+                }
+              >
+                <FolderPlus size={14} />
+                新建文件夹
+              </MenuItem>
+            </Menu>
+          }
+          more={
+            <Menu label={`${cfg.label}列表操作`} iconOnly triggerClassName="icon-control">
+              <MenuItem onSelect={() => setEntrySort("order")}>
+                <Check size={14} className={entrySort === "order" ? "opacity-100" : "opacity-0"} />
+                按手动排序
+              </MenuItem>
+              <MenuItem onSelect={() => setEntrySort("updated")}>
+                <Check
+                  size={14}
+                  className={entrySort === "updated" ? "opacity-100" : "opacity-0"}
+                />
+                按最近更新
+              </MenuItem>
+              <MenuItem onSelect={() => setEntrySort("title")}>
+                <Check size={14} className={entrySort === "title" ? "opacity-100" : "opacity-0"} />
+                按名称排序
+              </MenuItem>
+              {kindFolders.length > 0 && (
+                <>
+                  <MenuSeparator />
+                  <MenuItem
+                    onSelect={() => {
+                      setCollapsedGroups((cur) => {
+                        const next = { ...cur };
+                        for (const f of kindFolders) {
+                          delete next[`folder:${kind}:${f.title}`];
+                        }
+                        return next;
+                      });
+                    }}
+                  >
+                    <ChevronDown size={14} />
+                    展开全部文件夹
+                  </MenuItem>
+                  <MenuItem
+                    onSelect={() => {
+                      setCollapsedGroups((cur) => {
+                        const next = { ...cur };
+                        for (const f of kindFolders) {
+                          next[`folder:${kind}:${f.title}`] = true;
+                        }
+                        return next;
+                      });
+                    }}
+                  >
+                    <ChevronRight size={14} />
+                    折叠全部文件夹
+                  </MenuItem>
+                </>
+              )}
+            </Menu>
+          }
+        />
+
+        <div
+          className={`directory-uncategorized ${dropTarget === uncategorizedDropKey ? "is-drop-target" : ""}`}
+          onDragOver={(event) => {
+            if (entrySort === "order" && dragItem?.kind === "entry") {
+              event.preventDefault();
+              setDropTarget(uncategorizedDropKey);
+            }
+          }}
+          onDragLeave={() => {
+            if (dropTarget === uncategorizedDropKey) setDropTarget(null);
+          }}
+          onDrop={(event) => {
+            event.preventDefault();
+            setDropTarget(null);
+            if (entrySort === "order" && dragItem?.kind === "entry") {
+              const dragged = data.entries.find((e) => e.id === dragItem.id);
+              if (dragged) void moveEntry(dragged, kind, "");
+            }
+            setDragItem(null);
+          }}
+        >
+          {uncategorized.map((item) => renderEntryRow(item))}
+        </div>
+
+        {folderBuckets.map(({ folder, items, visible }, index) => {
+          if (!visible) return null;
+          const folderKey = `folder:${kind}:${folder.title}`;
+          const collapsed = q ? false : Boolean(collapsedGroups[folderKey]);
+          return (
+            <section className="directory-group" key={folder.id}>
+              <div
+                className={`directory-group-header ${dropTarget === folderKey ? "is-drop-target" : ""}`}
+                onDragOver={(event) => {
+                  if (dragItem?.kind === "entry") {
+                    event.preventDefault();
+                    setDropTarget(folderKey);
+                  }
+                }}
+                onDragLeave={() => {
+                  if (dropTarget === folderKey) setDropTarget(null);
+                }}
+                onDrop={(event) => {
+                  event.preventDefault();
+                  setDropTarget(null);
+                  if (dragItem?.kind === "entry") {
+                    const dragged = data.entries.find((e) => e.id === dragItem.id);
+                    if (dragged) void moveEntry(dragged, kind, folder.title);
+                  }
+                  setDragItem(null);
+                }}
+              >
+                <button
+                  type="button"
+                  className="directory-group-toggle"
+                  aria-expanded={!collapsed}
+                  onClick={() => setCollapsedGroups((cur) => ({ ...cur, [folderKey]: !collapsed }))}
+                >
+                  {collapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+                  <div className="directory-group-heading">
+                    <span className="directory-group-name">{folder.title}</span>
+                    {folder.description && (
+                      <span className="directory-group-subtitle">{folder.description}</span>
+                    )}
+                  </div>
+                </button>
+                <span className="directory-group-count">{items.length}</span>
+                <div className="directory-actions">
+                  <Button
+                    variant="ghost"
+                    className="icon-control"
+                    title={`在 ${folder.title} 新建${cfg.itemLabel}`}
+                    aria-label={`在 ${folder.title} 新建${cfg.itemLabel}`}
+                    onClick={() => createEntryDirect(kind, folder.title)}
+                  >
+                    <Plus size={14} />
+                  </Button>
+                  <Menu label={`${folder.title}的操作`} iconOnly>
+                    <MenuItem
+                      onSelect={() =>
+                        setGroupForm({
+                          target: "folder",
+                          id: folder.id,
+                          entryKind: kind,
+                          title: folder.title,
+                          description: folder.description,
+                        })
+                      }
+                    >
+                      <Pencil size={14} />
+                      编辑名称与副标题
+                    </MenuItem>
+                    <MenuItem
+                      disabled={busy || index === 0}
+                      onSelect={() => void reorderFolders(kind, folder.id, -1)}
+                    >
+                      <ArrowUp size={14} />
+                      上移
+                    </MenuItem>
+                    <MenuItem
+                      disabled={busy || index === kindFolders.length - 1}
+                      onSelect={() => void reorderFolders(kind, folder.id, 1)}
+                    >
+                      <ArrowDown size={14} />
+                      下移
+                    </MenuItem>
+                    <MenuSeparator />
+                    <MenuItem
+                      danger
+                      onSelect={() =>
+                        setDeletion({
+                          path: `/folders/${folder.id}`,
+                          title: folder.title,
+                          id: folder.id,
+                          kind: "folder",
+                        })
+                      }
+                    >
+                      <Trash2 size={14} />
+                      删除文件夹
+                    </MenuItem>
+                  </Menu>
+                </div>
+              </div>
+              {!collapsed && (
+                <div className="directory-group-items">
+                  {items.length > 0 ? (
+                    items.map((item) => renderEntryRow(item))
+                  ) : (
+                    <p className="directory-group-empty">此文件夹暂无条目</p>
+                  )}
+                </div>
+              )}
+            </section>
+          );
+        })}
+
+        {loaded && kindEntries.length === 0 && kindFolders.length === 0 && (
+          <EmptyState title={cfg.emptyTitle}>
+            <Button onClick={() => createEntryDirect(kind, "")}>
+              <Plus size={14} />
+              新建{cfg.itemLabel}
+            </Button>
+          </EmptyState>
+        )}
+      </>
+    );
+  }
+
   return (
     <div
-      className={`app-shell ${sidebarClosed ? "sidebar-collapsed" : ""} ${resizing ? "is-resizing" : ""}`}
+      className={`app-shell ${sidebarClosed ? "sidebar-collapsed" : ""} ${resizing || resizingCompanion ? "is-resizing" : ""}`}
       style={
         !sidebarClosed
           ? { gridTemplateColumns: `48px ${sidebarWidth}px minmax(0, 1fr)` }
@@ -987,31 +1714,68 @@ export function Workspace({
           aria-pressed={route === "shelf"}
           onClick={() => switchRoute("shelf")}
         >
-          <LibraryBig size={21} />
+          <LibraryBig size={20} />
         </Button>
+
         <div className="activity-primary">
           <Button
             variant="ghost"
             className={`activity-button ${route === "chapters" ? "is-active" : ""}`}
             disabled={!book}
-            title={book ? `章节 · ${book.title}` : "请先新建作品"}
-            aria-label="章节"
+            title={book ? `写作 · ${book.title}` : "请先新建作品"}
+            aria-label="写作"
             aria-pressed={route === "chapters"}
             onClick={() => switchRoute("chapters")}
           >
-            <BookOpen size={21} />
+            <BookOpen size={20} />
           </Button>
           <Button
             variant="ghost"
-            className={`activity-button ${route === "entries" ? "is-active" : ""}`}
+            className={`activity-button ${route === "characters" ? "is-active" : ""}`}
             disabled={!book}
-            title={book ? `设定 · ${book.title}` : "请先新建作品"}
-            aria-label="设定"
-            aria-pressed={route === "entries"}
-            onClick={() => switchRoute("entries")}
+            title={book ? `角色 · ${book.title}` : "请先新建作品"}
+            aria-label="角色"
+            aria-pressed={route === "characters"}
+            onClick={() => switchRoute("characters")}
           >
-            <NotebookPen size={21} />
+            <UserRound size={20} />
           </Button>
+          <Button
+            variant="ghost"
+            className={`activity-button ${route === "world" ? "is-active" : ""}`}
+            disabled={!book}
+            title={book ? `背景设定 · ${book.title}` : "请先新建作品"}
+            aria-label="背景设定"
+            aria-pressed={route === "world"}
+            onClick={() => switchRoute("world")}
+          >
+            <Globe size={20} />
+          </Button>
+          <Button
+            variant="ghost"
+            className={`activity-button ${route === "outline" ? "is-active" : ""}`}
+            disabled={!book}
+            title={book ? `提纲 · ${book.title}` : "请先新建作品"}
+            aria-label="提纲"
+            aria-pressed={route === "outline"}
+            onClick={() => switchRoute("outline")}
+          >
+            <ListTree size={20} />
+          </Button>
+          <Button
+            variant="ghost"
+            className={`activity-button ${route === "notes" ? "is-active" : ""}`}
+            disabled={!book}
+            title={book ? `笔记 · ${book.title}` : "请先新建作品"}
+            aria-label="笔记"
+            aria-pressed={route === "notes"}
+            onClick={() => switchRoute("notes")}
+          >
+            <FileText size={20} />
+          </Button>
+
+          <div className="activity-divider" aria-hidden="true" />
+
           <Button
             variant="ghost"
             className={`activity-button ${route === "discussion" ? "is-active" : ""}`}
@@ -1021,18 +1785,18 @@ export function Workspace({
             aria-pressed={route === "discussion"}
             onClick={() => switchRoute("discussion")}
           >
-            <MessagesSquare size={21} />
+            <MessageCircle size={20} />
           </Button>
           <Button
             variant="ghost"
             className={`activity-button ${route === "pending" ? "is-active" : ""}`}
             disabled={!book}
-            title={book ? `待审 · ${book.title}` : "请先新建作品"}
-            aria-label="待审"
+            title={book ? `待审变更 · ${book.title}` : "请先新建作品"}
+            aria-label="待审变更"
             aria-pressed={route === "pending"}
             onClick={() => switchRoute("pending")}
           >
-            <ListChecks size={21} />
+            <FileClock size={20} />
             {data.changes.length > 0 && (
               <span className="activity-count">
                 {data.changes.length > 99 ? "99+" : data.changes.length}
@@ -1041,19 +1805,37 @@ export function Workspace({
           </Button>
           <Button
             variant="ghost"
+            className={`activity-button ${route === "trash" ? "is-active" : ""}`}
+            disabled={!book}
+            title={
+              book
+                ? trashTotalCount > 0
+                  ? `回收站（${trashTotalCount}）`
+                  : "回收站"
+                : "请先新建作品"
+            }
+            aria-label="回收站"
+            aria-pressed={route === "trash"}
+            onClick={() => switchRoute("trash")}
+          >
+            <Trash2 size={20} />
+          </Button>
+          <Button
+            variant="ghost"
             className="activity-button"
             disabled={!book}
-            title={book ? "搜索 · Ctrl+K" : "请先新建作品"}
-            aria-label="搜索"
+            title={book ? "全书搜索 · Ctrl+K" : "请先新建作品"}
+            aria-label="全书搜索"
             onClick={() => {
               if (!book) return;
               if (route === "shelf") onOpenBook(book, "chapters", true);
               else onSearchOpenChange(true);
             }}
           >
-            <Search size={21} />
+            <Search size={20} />
           </Button>
         </div>
+
         <div className="activity-bottom">
           <Button
             variant="ghost"
@@ -1062,7 +1844,7 @@ export function Workspace({
             aria-label="设置"
             onClick={onSettings}
           >
-            <Settings2 size={21} />
+            <Settings2 size={20} />
           </Button>
         </div>
       </nav>
@@ -1076,108 +1858,239 @@ export function Workspace({
         <div className="directory-scroll">
           {route === "chapters" && (
             <>
-              <div className="directory-section-heading">
-                <h2>章节</h2>
-                <Menu label="新建" iconOnly>
-                  <MenuItem onSelect={() => newForm("volume")}>
-                    <FolderPlus size={14} />
-                    新建分卷
-                  </MenuItem>
-                  <MenuItem onSelect={() => newForm("chapter")}>
-                    <FilePlus2 size={14} />
-                    新建章节
-                  </MenuItem>
-                </Menu>
-              </div>
-              {data.volumes.map((volume, index) => {
-                const dropKey = `volume:${volume.id}`;
+              <DirectoryToolbar
+                searchValue={chapterFilter}
+                onSearchChange={setChapterFilter}
+                searchLabel="筛选章节"
+                searchPlaceholder="筛选章节…"
+                create={
+                  <Menu
+                    label="新建章节或分卷"
+                    iconOnly
+                    icon={<Plus size={15} />}
+                    triggerClassName="icon-control"
+                  >
+                    <MenuItem onSelect={() => createChapterDirect(null)}>
+                      <FilePlus2 size={14} />
+                      新建章节
+                    </MenuItem>
+                    <MenuItem
+                      onSelect={() =>
+                        setGroupForm({ target: "volume", title: "", description: "" })
+                      }
+                    >
+                      <FolderPlus size={14} />
+                      新建分卷
+                    </MenuItem>
+                  </Menu>
+                }
+                more={
+                  <Menu label="章节列表操作" iconOnly triggerClassName="icon-control">
+                    {data.volumes.length > 0 && (
+                      <>
+                        <MenuItem
+                          onSelect={() => {
+                            setCollapsedGroups((cur) => {
+                              const next = { ...cur };
+                              for (const v of data.volumes) delete next[`volume:${v.id}`];
+                              return next;
+                            });
+                          }}
+                        >
+                          <ChevronDown size={14} />
+                          展开全部分卷
+                        </MenuItem>
+                        <MenuItem
+                          onSelect={() => {
+                            setCollapsedGroups((cur) => {
+                              const next = { ...cur };
+                              for (const v of data.volumes) next[`volume:${v.id}`] = true;
+                              return next;
+                            });
+                          }}
+                        >
+                          <ChevronRight size={14} />
+                          折叠全部分卷
+                        </MenuItem>
+                        <MenuSeparator />
+                      </>
+                    )}
+                    {bookId && (
+                      <MenuSub label="导出作品" icon={<Download size={14} />}>
+                        <MenuItem onSelect={() => downloadBook(bookId, "zip")}>ZIP 完整包</MenuItem>
+                        <MenuItem onSelect={() => downloadBook(bookId, "md")}>
+                          Markdown 正文
+                        </MenuItem>
+                        <MenuItem onSelect={() => downloadBook(bookId, "txt")}>TXT 正文</MenuItem>
+                      </MenuSub>
+                    )}
+                  </Menu>
+                }
+              />
+
+              {(() => {
+                const chapterQuery = chapterFilter.trim().toLowerCase();
+                const uncategorizedChapters = data.chapters.filter(
+                  (item) =>
+                    item.volume_id === null &&
+                    (!chapterQuery || item.title.toLowerCase().includes(chapterQuery)),
+                );
+                const uncategorizedDropKey = "volume:none";
                 return (
-                  <section className="directory-group" key={volume.id}>
+                  <>
                     <div
-                      className={`directory-group-title ${dropTarget === dropKey ? "is-drop-target" : ""}`}
+                      className={`directory-uncategorized ${dropTarget === uncategorizedDropKey ? "is-drop-target" : ""}`}
                       onDragOver={(event) => {
                         if (dragItem?.kind === "chapter") {
                           event.preventDefault();
-                          setDropTarget(dropKey);
+                          setDropTarget(uncategorizedDropKey);
                         }
                       }}
                       onDragLeave={() => {
-                        if (dropTarget === dropKey) setDropTarget(null);
+                        if (dropTarget === uncategorizedDropKey) setDropTarget(null);
                       }}
                       onDrop={(event) => {
                         event.preventDefault();
                         setDropTarget(null);
                         if (dragItem?.kind === "chapter") {
                           const ch = data.chapters.find((c) => c.id === dragItem.id);
-                          if (ch) void moveChapterToVolume(ch, volume.id);
+                          if (ch) void moveChapterToVolume(ch, null);
                         }
                         setDragItem(null);
                       }}
                     >
-                      <Folder size={14} />
-                      <h3>{volume.title}</h3>
-                      <div className="directory-actions">
-                        <Button
-                          variant="ghost"
-                          className="icon-control"
-                          title={`在 ${volume.title} 新建章节`}
-                          aria-label={`在 ${volume.title} 新建章节`}
-                          onClick={() => newForm("chapter", volume.id)}
-                        >
-                          <Plus size={14} />
-                        </Button>
-                        <Menu label={`${volume.title}的操作`} iconOnly>
-                          <MenuItem
-                            disabled={busy || index === 0}
-                            onSelect={() => void reorderVolumes(volume.id, -1)}
-                          >
-                            <ArrowUp size={14} />
-                            上移
-                          </MenuItem>
-                          <MenuItem
-                            disabled={busy || index === data.volumes.length - 1}
-                            onSelect={() => void reorderVolumes(volume.id, 1)}
-                          >
-                            <ArrowDown size={14} />
-                            下移
-                          </MenuItem>
-                          <MenuItem
-                            onSelect={() =>
-                              setForm({ kind: "volume", id: volume.id, title: volume.title })
-                            }
-                          >
-                            <Pencil size={14} />
-                            重命名
-                          </MenuItem>
-                          <MenuSeparator />
-                          <MenuItem
-                            danger
-                            onSelect={() =>
-                              setDeletion({
-                                path: `/volumes/${volume.id}`,
-                                title: volume.title,
-                                id: volume.id,
-                              })
-                            }
-                          >
-                            <Trash2 size={14} />
-                            删除
-                          </MenuItem>
-                        </Menu>
-                      </div>
+                      {uncategorizedChapters.map((item) => renderChapterRow(item))}
                     </div>
-                    {data.chapters
-                      .filter((item) => item.volume_id === volume.id)
-                      .map((item) => renderChapterRow(item))}
-                  </section>
+
+                    {data.volumes.map((volume, index) => {
+                      const dropKey = `volume:${volume.id}`;
+                      const collapsed = chapterQuery ? false : Boolean(collapsedGroups[dropKey]);
+                      const volumeMatches =
+                        !chapterQuery || volume.title.toLowerCase().includes(chapterQuery);
+                      const volumeChapters = data.chapters.filter(
+                        (item) =>
+                          item.volume_id === volume.id &&
+                          (volumeMatches || item.title.toLowerCase().includes(chapterQuery)),
+                      );
+                      if (chapterQuery && !volumeMatches && volumeChapters.length === 0) {
+                        return null;
+                      }
+                      return (
+                        <section className="directory-group" key={volume.id}>
+                          <div
+                            className={`directory-group-header ${dropTarget === dropKey ? "is-drop-target" : ""}`}
+                            onDragOver={(event) => {
+                              if (dragItem?.kind === "chapter") {
+                                event.preventDefault();
+                                setDropTarget(dropKey);
+                              }
+                            }}
+                            onDragLeave={() => {
+                              if (dropTarget === dropKey) setDropTarget(null);
+                            }}
+                            onDrop={(event) => {
+                              event.preventDefault();
+                              setDropTarget(null);
+                              if (dragItem?.kind === "chapter") {
+                                const ch = data.chapters.find((c) => c.id === dragItem.id);
+                                if (ch) void moveChapterToVolume(ch, volume.id);
+                              }
+                              setDragItem(null);
+                            }}
+                          >
+                            <button
+                              type="button"
+                              className="directory-group-toggle"
+                              aria-expanded={!collapsed}
+                              onClick={() =>
+                                setCollapsedGroups((cur) => ({ ...cur, [dropKey]: !collapsed }))
+                              }
+                            >
+                              {collapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+                              <div className="directory-group-heading">
+                                <span className="directory-group-name">{volume.title}</span>
+                                {volume.description && (
+                                  <span className="directory-group-subtitle">
+                                    {volume.description}
+                                  </span>
+                                )}
+                              </div>
+                            </button>
+                            <span className="directory-group-count">{volumeChapters.length}</span>
+                            <div className="directory-actions">
+                              <Button
+                                variant="ghost"
+                                className="icon-control"
+                                title={`在 ${volume.title} 新建章节`}
+                                aria-label={`在 ${volume.title} 新建章节`}
+                                onClick={() => createChapterDirect(volume.id)}
+                              >
+                                <Plus size={14} />
+                              </Button>
+                              <Menu label={`${volume.title}的操作`} iconOnly>
+                                <MenuItem
+                                  onSelect={() =>
+                                    setGroupForm({
+                                      target: "volume",
+                                      id: volume.id,
+                                      title: volume.title,
+                                      description: volume.description,
+                                    })
+                                  }
+                                >
+                                  <Pencil size={14} />
+                                  编辑名称与副标题
+                                </MenuItem>
+                                <MenuItem
+                                  disabled={busy || index === 0}
+                                  onSelect={() => void reorderVolumes(volume.id, -1)}
+                                >
+                                  <ArrowUp size={14} />
+                                  上移
+                                </MenuItem>
+                                <MenuItem
+                                  disabled={busy || index === data.volumes.length - 1}
+                                  onSelect={() => void reorderVolumes(volume.id, 1)}
+                                >
+                                  <ArrowDown size={14} />
+                                  下移
+                                </MenuItem>
+                                <MenuSeparator />
+                                <MenuItem
+                                  danger
+                                  onSelect={() =>
+                                    setDeletion({
+                                      path: `/volumes/${volume.id}`,
+                                      title: volume.title,
+                                      id: volume.id,
+                                      kind: "volume",
+                                    })
+                                  }
+                                >
+                                  <Trash2 size={14} />
+                                  删除
+                                </MenuItem>
+                              </Menu>
+                            </div>
+                          </div>
+                          {!collapsed && (
+                            <div className="directory-group-items">
+                              {volumeChapters.length > 0 ? (
+                                volumeChapters.map((item) => renderChapterRow(item))
+                              ) : (
+                                <p className="directory-group-empty">此卷暂无章节</p>
+                              )}
+                            </div>
+                          )}
+                        </section>
+                      );
+                    })}
+                  </>
                 );
-              })}
-              {data.chapters
-                .filter((item) => item.volume_id === null)
-                .map((item) => renderChapterRow(item))}
-              {loaded && data.chapters.length === 0 && (
+              })()}
+              {loaded && data.chapters.length === 0 && data.volumes.length === 0 && (
                 <EmptyState title="暂无章节">
-                  <Button onClick={() => newForm("chapter")}>
+                  <Button onClick={() => createChapterDirect(null)}>
                     <Plus size={14} />
                     新建章节
                   </Button>
@@ -1186,126 +2099,7 @@ export function Workspace({
             </>
           )}
 
-          {route === "entries" && (
-            <>
-              <div className="directory-section-heading">
-                <h2>设定</h2>
-                {data.entries.length > 0 && (
-                  <Button
-                    variant="ghost"
-                    className={`directory-manage-btn ${batchMode ? "is-active" : ""}`}
-                    aria-pressed={batchMode}
-                    onClick={() => {
-                      setBatchMode((value) => {
-                        if (value) setSelectedEntryIds([]);
-                        return !value;
-                      });
-                    }}
-                  >
-                    {batchMode ? "完成" : "管理"}
-                  </Button>
-                )}
-              </div>
-              {entryKinds.map(({ value: kind, label }) => {
-                const items = data.entries.filter((item) => item.kind === kind);
-                const uncategorized = items.filter((item) => !item.category.trim());
-                const folders = new Map<string, Entry[]>();
-                for (const item of items) {
-                  const cat = item.category.trim();
-                  if (!cat) continue;
-                  const bucket = folders.get(cat);
-                  if (bucket) bucket.push(item);
-                  else folders.set(cat, [item]);
-                }
-                const groupDropKey = `group:${kind}`;
-                return (
-                  <section className="directory-group" key={kind}>
-                    <div
-                      className={`directory-group-title ${dropTarget === groupDropKey ? "is-drop-target" : ""}`}
-                      onDragOver={(event) => {
-                        if (dragItem?.kind === "entry") {
-                          event.preventDefault();
-                          setDropTarget(groupDropKey);
-                        }
-                      }}
-                      onDragLeave={() => {
-                        if (dropTarget === groupDropKey) setDropTarget(null);
-                      }}
-                      onDrop={(event) => {
-                        event.preventDefault();
-                        setDropTarget(null);
-                        if (dragItem?.kind === "entry") {
-                          const dragged = data.entries.find((e) => e.id === dragItem.id);
-                          if (dragged) void moveEntry(dragged, kind, "");
-                        }
-                        setDragItem(null);
-                      }}
-                    >
-                      <h3>{label}</h3>
-                      <Button
-                        variant="ghost"
-                        className="icon-control"
-                        title={`新建${label}`}
-                        aria-label={`新建${label}`}
-                        onClick={() => newForm("entry", "none", kind)}
-                      >
-                        <Plus size={14} />
-                      </Button>
-                    </div>
-                    {[...folders.entries()].map(([folderName, folderItems]) => {
-                      const folderKey = `folder:${kind}:${folderName}`;
-                      const collapsed = Boolean(collapsedFolders[folderKey]);
-                      return (
-                        <div className="directory-folder" key={folderKey}>
-                          <button
-                            type="button"
-                            className={`directory-folder-toggle ${dropTarget === folderKey ? "is-drop-target" : ""}`}
-                            aria-expanded={!collapsed}
-                            onClick={() =>
-                              setCollapsedFolders((current) => ({
-                                ...current,
-                                [folderKey]: !collapsed,
-                              }))
-                            }
-                            onDragOver={(event) => {
-                              if (dragItem?.kind === "entry") {
-                                event.preventDefault();
-                                setDropTarget(folderKey);
-                              }
-                            }}
-                            onDragLeave={() => {
-                              if (dropTarget === folderKey) setDropTarget(null);
-                            }}
-                            onDrop={(event) => {
-                              event.preventDefault();
-                              setDropTarget(null);
-                              if (dragItem?.kind === "entry") {
-                                const dragged = data.entries.find((e) => e.id === dragItem.id);
-                                if (dragged) void moveEntry(dragged, kind, folderName);
-                              }
-                              setDragItem(null);
-                            }}
-                          >
-                            {collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
-                            <Folder size={13} />
-                            <span>{folderName}</span>
-                            <span className="directory-folder-count">{folderItems.length}</span>
-                          </button>
-                          {!collapsed && (
-                            <div className="directory-folder-items">
-                              {folderItems.map((item) => renderEntryRow(item))}
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })}
-                    {uncategorized.map((item) => renderEntryRow(item))}
-                    {items.length === 0 && <p className="directory-empty">暂无条目</p>}
-                  </section>
-                );
-              })}
-            </>
-          )}
+          {isEntryRoute(route) && renderEntryDirectory(route)}
 
           <div
             ref={setSessionSidebar}
@@ -1315,95 +2109,124 @@ export function Workspace({
 
           {route === "pending" && (
             <>
-              <div className="directory-section-heading">
-                <h2>待审变更</h2>
-                <span className="directory-meta">{data.changes.length}</span>
-              </div>
-              {data.changes.map((change) => (
-                <Button
+              <DirectoryToolbar
+                searchValue={pendingFilter}
+                onSearchChange={setPendingFilter}
+                searchLabel="筛选待审变更"
+                searchPlaceholder="筛选待审变更…"
+                badge={
+                  data.changes.length > 0 ? (
+                    <span className="directory-toolbar-badge">{data.changes.length}</span>
+                  ) : null
+                }
+                more={
+                  <Menu label="待审变更排序" iconOnly triggerClassName="icon-control">
+                    <MenuItem onSelect={() => setPendingSort("newest")}>
+                      <Check
+                        size={14}
+                        className={pendingSort === "newest" ? "opacity-100" : "opacity-0"}
+                      />
+                      最新优先
+                    </MenuItem>
+                    <MenuItem onSelect={() => setPendingSort("oldest")}>
+                      <Check
+                        size={14}
+                        className={pendingSort === "oldest" ? "opacity-100" : "opacity-0"}
+                      />
+                      最旧优先
+                    </MenuItem>
+                  </Menu>
+                }
+              />
+              {visiblePending.map((change) => (
+                <button
                   key={change.id}
-                  variant="ghost"
+                  type="button"
                   className={`pending-directory-item ${currentPending?.id === change.id ? "is-selected" : ""}`}
                   onClick={() => setFocusPending(change.id)}
                 >
-                  <span>{change.title || "正文变更"}</span>
-                  <small>
+                  <span className="directory-row-title">{change.title || "正文变更"}</span>
+                  <span className="directory-row-meta">
                     {change.action === "create"
                       ? "新增"
                       : change.action === "delete"
                         ? "删除"
                         : "修改"}
-                  </small>
-                </Button>
+                    {" · "}
+                    {change.target_type === "chapter" ? "章节" : "设定"}
+                    {change.created_at ? ` · ${formatRelativeTime(change.created_at)}` : ""}
+                  </span>
+                </button>
               ))}
-              {data.changes.length === 0 && <p className="directory-empty">暂无待审变更</p>}
+              {visiblePending.length === 0 && <p className="directory-empty">暂无待审变更</p>}
+            </>
+          )}
+
+          {route === "trash" && (
+            <>
+              <DirectoryToolbar
+                searchValue={trashFilter}
+                onSearchChange={setTrashFilter}
+                searchLabel="筛选回收站"
+                searchPlaceholder="筛选回收站…"
+                more={
+                  <Menu label="回收站操作" iconOnly triggerClassName="icon-control">
+                    <MenuItem
+                      danger
+                      disabled={busy || trashTotalCount === 0}
+                      onSelect={() => setTrashConfirm("empty")}
+                    >
+                      <Trash2 size={14} />
+                      清空回收站
+                    </MenuItem>
+                  </Menu>
+                }
+              />
+              {trashItems.map((item) => {
+                const isSelected =
+                  activeTrashItem?.kind === item.kind && activeTrashItem.id === item.id;
+                const deletedTime = formatRelativeTime(item.deletedAt);
+                return (
+                  <div
+                    key={`${item.kind}:${item.id}`}
+                    className={`directory-row trash-row ${isSelected ? "is-selected" : ""}`}
+                  >
+                    <button
+                      type="button"
+                      className="directory-row-trigger"
+                      onClick={() => setSelectedTrash({ kind: item.kind, id: item.id })}
+                    >
+                      <span className="directory-row-title">{item.title || "无标题"}</span>
+                      <span className="directory-row-meta">
+                        {item.kindLabel}
+                        {deletedTime ? ` · 删除于 ${deletedTime}` : ""}
+                      </span>
+                    </button>
+                    <div className="directory-actions">
+                      <Button
+                        variant="ghost"
+                        className="icon-control"
+                        title="还原"
+                        aria-label={`还原 ${item.title}`}
+                        disabled={busy}
+                        onClick={() =>
+                          void restoreTrashItem({
+                            kind: item.kind,
+                            id: item.id,
+                            title: item.title,
+                          })
+                        }
+                      >
+                        <RotateCcw size={14} />
+                      </Button>
+                    </div>
+                  </div>
+                );
+              })}
+              {trashItems.length === 0 && <p className="directory-empty">回收站为空</p>}
             </>
           )}
         </div>
-
-        {route === "entries" && batchMode && (
-          <div className="directory-batch-bar">
-            <div className="directory-batch-meta">
-              <span>已选 {selectedEntryIds.length} 项</span>
-              <button
-                type="button"
-                className="text-xs text-zinc-500 hover:text-zinc-900"
-                onClick={() =>
-                  setSelectedEntryIds(
-                    selectedEntryIds.length === data.entries.length
-                      ? []
-                      : data.entries.map((item) => item.id),
-                  )
-                }
-              >
-                {selectedEntryIds.length === data.entries.length ? "清空" : "全选"}
-              </button>
-            </div>
-            <div className="directory-batch-actions">
-              <Button
-                disabled={busy || selectedEntryIds.length === 0}
-                onClick={() => void applyBatchVisibility("local")}
-              >
-                设为公开
-              </Button>
-              <Button
-                disabled={busy || selectedEntryIds.length === 0}
-                onClick={() => void applyBatchVisibility("global")}
-              >
-                设为仅全局
-              </Button>
-              <Menu label="移动到…" triggerClassName="button-secondary">
-                {entryKinds.map(({ value: kind, label }) => {
-                  const folders = categoriesFor(kind);
-                  return (
-                    <MenuSub key={kind} label={label}>
-                      <MenuItem onSelect={() => void applyBatchMove(kind, "")}>
-                        直接放到{label}下
-                      </MenuItem>
-                      {folders.length > 0 && <MenuSeparator />}
-                      {folders.map((folderName) => (
-                        <MenuItem
-                          key={folderName}
-                          onSelect={() => void applyBatchMove(kind, folderName)}
-                        >
-                          <Folder size={13} />
-                          {folderName}
-                        </MenuItem>
-                      ))}
-                    </MenuSub>
-                  );
-                })}
-              </Menu>
-              <Button
-                variant="danger"
-                disabled={busy || selectedEntryIds.length === 0}
-                onClick={() => setBatchDeleteOpen(true)}
-              >
-                删除
-              </Button>
-            </div>
-          </div>
-        )}
         <div
           className="sidebar-resize-handle"
           role="separator"
@@ -1421,12 +2244,17 @@ export function Workspace({
             ? "shelf-view"
             : route === "discussion"
               ? "discussion-view"
-              : route === "pending"
+              : route === "pending" || route === "trash"
                 ? "pending-view"
                 : editing && companionOpen
                   ? "with-companion"
                   : ""
         }`}
+        style={
+          editing && companionOpen
+            ? { gridTemplateColumns: `minmax(0, 1fr) ${companionWidth}px` }
+            : undefined
+        }
       >
         <main
           className={`workspace-document ${route === "discussion" ? "is-collapsed" : ""}`}
@@ -1448,6 +2276,20 @@ export function Workspace({
                     <Button variant="primary" onClick={onNewBook}>
                       <Plus size={16} />
                       新建作品
+                    </Button>
+                    <input
+                      ref={importInputRef}
+                      type="file"
+                      accept=".zip,application/zip"
+                      hidden
+                      onChange={(event) => {
+                        void importZipBook(event.target.files?.[0]);
+                        event.target.value = "";
+                      }}
+                    />
+                    <Button disabled={importing} onClick={() => importInputRef.current?.click()}>
+                      <Upload size={16} />
+                      {importing ? "导入中…" : "导入作品"}
                     </Button>
                   </div>
                 </header>
@@ -1491,29 +2333,52 @@ export function Workspace({
                           </div>
                           <div className="book-card-details">
                             <span className="book-card-title">{item.title}</span>
-                            {item.description && (
-                              <p className="book-card-desc">{item.description}</p>
-                            )}
+                            <p className="book-card-stats">
+                              {item.word_count.toLocaleString("zh-CN")} 字 · {item.chapter_count} 章
+                            </p>
                             <div className="book-card-footer">
                               <span className="book-card-date">
                                 {new Date(item.updated_at).toLocaleDateString("zh-CN")}
                               </span>
                               <div
-                                className="book-card-menu"
+                                className="book-card-actions"
                                 onClick={(event) => event.stopPropagation()}
                                 onKeyDown={(event) => event.stopPropagation()}
                               >
-                                <Menu label={`管理 ${item.title}`} iconOnly>
-                                  <MenuItem onSelect={() => onEditBook(item)}>
-                                    <Pencil size={14} />
-                                    编辑作品
+                                <Menu
+                                  label={`导出 ${item.title}`}
+                                  iconOnly
+                                  icon={<Download size={14} />}
+                                  triggerClassName="book-card-action"
+                                >
+                                  <MenuItem onSelect={() => downloadBook(item.id, "zip")}>
+                                    ZIP 完整包
                                   </MenuItem>
-                                  <MenuSeparator />
-                                  <MenuItem danger onSelect={() => onDeleteBook(item)}>
-                                    <Trash2 size={14} />
-                                    删除作品
+                                  <MenuItem onSelect={() => downloadBook(item.id, "md")}>
+                                    Markdown 正文
+                                  </MenuItem>
+                                  <MenuItem onSelect={() => downloadBook(item.id, "txt")}>
+                                    TXT 正文
                                   </MenuItem>
                                 </Menu>
+                                <Button
+                                  variant="ghost"
+                                  className="icon-button book-card-action"
+                                  title={`编辑 ${item.title}`}
+                                  aria-label={`编辑 ${item.title}`}
+                                  onClick={() => onEditBook(item)}
+                                >
+                                  <Pencil size={14} />
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  className="icon-button book-card-action book-card-action-danger"
+                                  title={`删除 ${item.title}`}
+                                  aria-label={`删除 ${item.title}`}
+                                  onClick={() => onDeleteBook(item)}
+                                >
+                                  <Trash2 size={14} />
+                                </Button>
                               </div>
                             </div>
                           </div>
@@ -1528,18 +2393,77 @@ export function Workspace({
 
           {editing && (
             <div className="document-content">
+              {openTabs.length > 0 && (
+                <div className="doc-tabs-bar" role="tablist" aria-label="已打开文档">
+                  {openTabs.map((tab) => {
+                    const tabChapter =
+                      tab.kind === "chapter"
+                        ? data.chapters.find((c) => c.id === tab.id)
+                        : undefined;
+                    const tabEntry =
+                      tab.kind === "entry" ? data.entries.find((e) => e.id === tab.id) : undefined;
+                    const tabDoc = tabChapter ?? tabEntry;
+                    if (!tabDoc) return null;
+                    const isActiveTab = selected?.kind === tab.kind && selected.id === tab.id;
+                    return (
+                      <div
+                        key={`${tab.kind}:${tab.id}`}
+                        className={`doc-tab ${isActiveTab ? "is-active" : ""}`}
+                      >
+                        <button
+                          type="button"
+                          role="tab"
+                          aria-selected={isActiveTab}
+                          className="doc-tab-trigger"
+                          title={tabDoc.title}
+                          onClick={() => choose(tab)}
+                        >
+                          {docIcon(tab.kind === "chapter" ? "chapter" : (tabEntry?.kind ?? "note"))}
+                          <span>{tabDoc.title}</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="doc-tab-close"
+                          aria-label={`关闭 ${tabDoc.title}`}
+                          onClick={() => closeTab(tab)}
+                        >
+                          <X size={12} />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
               {documentValue && selected && bookId ? (
-                <Editor
-                  key={`${selected.kind}:${selected.id}`}
-                  documentKey={`${bookId}:${selected.kind}:${selected.id}`}
-                  value={documentValue}
-                  kind={selected.kind === "chapter" ? "章节" : "设定"}
-                  onSave={save}
-                  ref={editor}
-                  active={editing}
-                  toolbarStart={sidebarToggle}
-                  toolbarEnd={companionToggle}
-                />
+                <>
+                  <Editor
+                    key={`${selected.kind}:${selected.id}`}
+                    documentKey={`${bookId}:${selected.kind}:${selected.id}`}
+                    value={documentValue}
+                    kind={
+                      selected.kind === "chapter" ? "章节" : entryKindLabel(entry?.kind ?? "note")
+                    }
+                    onSave={save}
+                    onHistory={() => setHistoryOpen(true)}
+                    ref={editor}
+                    active={editing}
+                    autoFocusTitle={
+                      autoFocusTarget?.kind === selected.kind && autoFocusTarget.id === selected.id
+                    }
+                    toolbarStart={sidebarToggle}
+                    toolbarEnd={companionToggle}
+                  />
+                  <RevisionDialog
+                    open={historyOpen}
+                    onOpenChange={setHistoryOpen}
+                    bookId={bookId}
+                    targetType={selected.kind}
+                    targetId={selected.id}
+                    currentTitle={documentValue.title}
+                    currentContent={documentValue.content}
+                    onRestored={refresh}
+                  />
+                </>
               ) : (
                 <>
                   <div className="document-empty-toolbar">
@@ -1547,12 +2471,26 @@ export function Workspace({
                     {companionToggle}
                   </div>
                   <EmptyState
-                    title={loaded ? (route === "entries" ? "暂无设定" : "暂无章节") : "正在载入"}
+                    title={
+                      loaded
+                        ? isEntryRoute(route)
+                          ? entryRouteConfig[route].emptyTitle
+                          : "暂无章节"
+                        : "正在载入"
+                    }
                   >
                     {loaded && (
-                      <Button onClick={() => newForm(route === "entries" ? "entry" : "chapter")}>
+                      <Button
+                        onClick={() =>
+                          isEntryRoute(route)
+                            ? createEntryDirect(entryRouteConfig[route].kind, "")
+                            : createChapterDirect(null)
+                        }
+                      >
                         <Plus size={14} />
-                        {route === "entries" ? "新建设定" : "新建章节"}
+                        {isEntryRoute(route)
+                          ? `新建${entryRouteConfig[route].itemLabel}`
+                          : "新建章节"}
                       </Button>
                     )}
                   </EmptyState>
@@ -1564,15 +2502,93 @@ export function Workspace({
           {route === "pending" && (
             <div className="pending-content">
               <PendingPanel
+                bookId={bookId ?? undefined}
                 showHeading={false}
                 toolbarStart={sidebarToggle}
                 changes={currentPending ? [currentPending] : []}
+                totalCount={data.changes.length}
                 onChanged={refresh}
                 focusedId={currentPending?.id ?? null}
                 beforeApply={(change) =>
                   !(editor.current?.dirty && change.target_id === selected?.id)
                 }
+                beforeApplyAll={() =>
+                  !(
+                    editor.current?.dirty &&
+                    data.changes.some((change) => change.target_id === selected?.id)
+                  )
+                }
               />
+            </div>
+          )}
+
+          {route === "trash" && (
+            <div className="trash-content">
+              <div className="panel-toolbar">
+                <div className="row editor-info">
+                  {sidebarToggle}
+                  <span className="toolbar-divider" aria-hidden="true" />
+                  <span className="editor-meta">
+                    <Trash2 size={14} />
+                    <span>回收站</span>
+                    {activeTrashItem && (
+                      <>
+                        <span className="editor-meta-sep" aria-hidden="true">
+                          ·
+                        </span>
+                        <span>{activeTrashItem.kindLabel}</span>
+                      </>
+                    )}
+                  </span>
+                </div>
+                {activeTrashItem && (
+                  <div className="row editor-actions">
+                    <Button
+                      disabled={busy}
+                      onClick={() =>
+                        void restoreTrashItem({
+                          kind: activeTrashItem.kind,
+                          id: activeTrashItem.id,
+                          title: activeTrashItem.title,
+                        })
+                      }
+                    >
+                      <RotateCcw size={14} />
+                      还原
+                    </Button>
+                    <Button
+                      variant="danger"
+                      disabled={busy}
+                      onClick={() =>
+                        setTrashConfirm({
+                          kind: activeTrashItem.kind,
+                          id: activeTrashItem.id,
+                          title: activeTrashItem.title,
+                        })
+                      }
+                    >
+                      <Trash2 size={14} />
+                      彻底删除
+                    </Button>
+                  </div>
+                )}
+              </div>
+              {activeTrashItem ? (
+                <div className="trash-preview">
+                  <h2 className="trash-preview-title">{activeTrashItem.title || "无标题"}</h2>
+                  <p className="trash-preview-meta">
+                    {activeTrashItem.kindLabel}
+                    {activeTrashItem.deletedAt
+                      ? ` · 删除于 ${new Date(activeTrashItem.deletedAt).toLocaleString("zh-CN")}`
+                      : ""}
+                  </p>
+                  <pre className="trash-preview-body">{activeTrashItem.content || "（空白）"}</pre>
+                </div>
+              ) : (
+                <EmptyState title="回收站为空">
+                  删除的章节和设定会暂存在这里，支持还原或彻底清除。
+                </EmptyState>
+              )}
             </div>
           )}
         </main>
@@ -1583,10 +2599,23 @@ export function Workspace({
           }`}
           aria-hidden={route !== "discussion" && !(editing && companionOpen)}
         >
+          {editing && companionOpen && (
+            <div
+              className="companion-resize-handle"
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="调整 AI 面板宽度"
+              title="拖动调整宽度（双击恢复默认）"
+              onPointerDown={startCompanionResize}
+              onDoubleClick={() => updateCompanionWidth(DEFAULT_COMPANION_WIDTH)}
+            />
+          )}
           {bookId && (
             <ChatPanel
               key={bookId}
               bookId={bookId}
+              chapters={data.chapters}
+              entries={data.entries}
               expanded={route === "discussion"}
               toolbarStart={sidebarToggle}
               sidebarTarget={sessionSidebar}
@@ -1629,7 +2658,7 @@ export function Workspace({
                     }
                   }
                 }}
-                placeholder="搜索章节、人物、世界观与笔记…"
+                placeholder="搜索章节、角色、背景设定、提纲与笔记…"
                 aria-label="搜索全书"
               />
               <kbd className="spotlight-kbd">Esc</kbd>
@@ -1642,33 +2671,42 @@ export function Workspace({
               ) : hits.length === 0 ? (
                 <p className="spotlight-hint">没有找到相关内容</p>
               ) : (
-                hits.map((hit, index) => (
-                  <button
-                    type="button"
-                    key={`${hit.target_type}:${hit.target_id}`}
-                    className={`spotlight-hit ${index === activeHit ? "is-active" : ""}`}
-                    onMouseEnter={() => setActiveHit(index)}
-                    onClick={() => {
-                      onSearchOpenChange(false);
-                      choose({ kind: hit.target_type, id: hit.target_id });
-                    }}
-                  >
-                    {hit.target_type === "chapter" ? (
-                      <BookOpen size={16} />
-                    ) : (
-                      <NotebookPen size={16} />
-                    )}
-                    <div className="spotlight-hit-body">
-                      <div className="spotlight-hit-top">
-                        <strong>{hit.title}</strong>
-                        <span className="spotlight-hit-kind">
-                          {hit.target_type === "chapter" ? "章节" : "设定"}
-                        </span>
+                hits.map((hit, index) => {
+                  const matchedEntry =
+                    hit.target_type === "entry"
+                      ? data.entries.find((e) => e.id === hit.target_id)
+                      : undefined;
+                  return (
+                    <button
+                      type="button"
+                      key={`${hit.target_type}:${hit.target_id}`}
+                      className={`spotlight-hit ${index === activeHit ? "is-active" : ""}`}
+                      onMouseEnter={() => setActiveHit(index)}
+                      onClick={() => {
+                        onSearchOpenChange(false);
+                        choose({ kind: hit.target_type, id: hit.target_id });
+                      }}
+                    >
+                      {docIcon(
+                        hit.target_type === "chapter" ? "chapter" : (matchedEntry?.kind ?? "note"),
+                        16,
+                      )}
+                      <div className="spotlight-hit-body">
+                        <div className="spotlight-hit-top">
+                          <strong>{hit.title}</strong>
+                          <span className="spotlight-hit-kind">
+                            {hit.target_type === "chapter"
+                              ? "章节"
+                              : matchedEntry
+                                ? entryKindLabel(matchedEntry.kind)
+                                : "设定"}
+                          </span>
+                        </div>
+                        <small>{hit.snippet.replace(/<[^>]*>/g, "")}</small>
                       </div>
-                      <small>{hit.snippet.replace(/<[^>]*>/g, "")}</small>
-                    </div>
-                  </button>
-                ))
+                    </button>
+                  );
+                })
               )}
             </div>
           </DialogPrimitive.Content>
@@ -1676,69 +2714,75 @@ export function Workspace({
       </DialogPrimitive.Root>
 
       <Dialog
-        open={form !== null}
+        open={groupForm !== null}
         onOpenChange={(open) => {
-          if (!open && !busy) setForm(null);
+          if (!open && !busy) setGroupForm(null);
         }}
-        title={`${form?.id ? "重命名" : "新建"}${
-          form?.kind === "volume" ? "分卷" : form?.kind === "chapter" ? "章节" : "设定"
-        }`}
+        title={
+          groupForm?.target === "volume"
+            ? groupForm.id
+              ? "编辑分卷"
+              : "新建分卷"
+            : groupForm?.id
+              ? "编辑文件夹"
+              : "新建文件夹"
+        }
       >
         <Alert>{error}</Alert>
-        {form && (
+        {groupForm && (
           <div className="stack">
             <Input
               label="名称"
               autoFocus
-              value={form.title}
-              onChange={(event) => setForm({ ...form, title: event.target.value })}
+              value={groupForm.title}
+              onChange={(event) => setGroupForm({ ...groupForm, title: event.target.value })}
             />
-            {form.kind === "chapter" && !form.id && (
-              <Select
-                label="所属分卷"
-                value={form.volumeId}
-                onChange={(value) => setForm({ ...form, volumeId: value })}
-                options={[
-                  { value: "none", label: "不分卷" },
-                  ...data.volumes.map((volume) => ({ value: volume.id, label: volume.title })),
-                ]}
-              />
-            )}
-            {form.kind === "entry" && !form.id && (
-              <>
-                <Select
-                  label="设定类型"
-                  value={form.entryKind}
-                  onChange={(value) =>
-                    setForm({ ...form, entryKind: entrySchema.shape.kind.parse(value) })
-                  }
-                  options={entryKinds.map((item) => ({
-                    value: item.value,
-                    label: item.value === "world" ? "世界观" : item.label,
-                  }))}
-                />
-                <Input
-                  label="文件夹（可选，仅一层）"
-                  value={form.category}
-                  list={`category-options-${form.entryKind}`}
-                  placeholder="留空则直接放在分组下"
-                  onChange={(event) => setForm({ ...form, category: event.target.value })}
-                />
-                <datalist id={`category-options-${form.entryKind}`}>
-                  {categoriesFor(form.entryKind).map((category) => (
-                    <option key={category} value={category} />
-                  ))}
-                </datalist>
-              </>
-            )}
+            <Input
+              label="副标题（可选）"
+              placeholder="一句话说明本分组的内容…"
+              value={groupForm.description}
+              onChange={(event) => setGroupForm({ ...groupForm, description: event.target.value })}
+            />
             <div className="dialog-actions">
-              <Button disabled={busy} onClick={() => setForm(null)}>
+              <Button disabled={busy} onClick={() => setGroupForm(null)}>
                 取消
               </Button>
               <Button
                 variant="primary"
-                disabled={busy || !form.title.trim()}
-                onClick={() => void submitForm()}
+                disabled={busy || !groupForm.title.trim()}
+                onClick={() => void submitGroupForm()}
+              >
+                {busy ? "保存中" : "确认"}
+              </Button>
+            </div>
+          </div>
+        )}
+      </Dialog>
+
+      <Dialog
+        open={renameForm !== null}
+        onOpenChange={(open) => {
+          if (!open && !busy) setRenameForm(null);
+        }}
+        title={renameForm?.target === "chapter" ? "重命名章节" : "重命名条目"}
+      >
+        <Alert>{error}</Alert>
+        {renameForm && (
+          <div className="stack">
+            <Input
+              label="名称"
+              autoFocus
+              value={renameForm.title}
+              onChange={(event) => setRenameForm({ ...renameForm, title: event.target.value })}
+            />
+            <div className="dialog-actions">
+              <Button disabled={busy} onClick={() => setRenameForm(null)}>
+                取消
+              </Button>
+              <Button
+                variant="primary"
+                disabled={busy || !renameForm.title.trim()}
+                onClick={() => void submitRenameForm()}
               >
                 {busy ? "保存中" : "确认"}
               </Button>
@@ -1760,10 +2804,8 @@ export function Workspace({
             <Input
               label="文件夹名称"
               autoFocus
-              value={folderPrompt.category}
-              onChange={(event) =>
-                setFolderPrompt({ ...folderPrompt, category: event.target.value })
-              }
+              value={folderPrompt.title}
+              onChange={(event) => setFolderPrompt({ ...folderPrompt, title: event.target.value })}
             />
             <div className="dialog-actions">
               <Button disabled={busy} onClick={() => setFolderPrompt(null)}>
@@ -1771,11 +2813,11 @@ export function Workspace({
               </Button>
               <Button
                 variant="primary"
-                disabled={busy || !folderPrompt.category.trim()}
+                disabled={busy || !folderPrompt.title.trim()}
                 onClick={() => {
                   const targetEntry = data.entries.find((e) => e.id === folderPrompt.entryId);
                   if (!targetEntry) return;
-                  void moveEntry(targetEntry, targetEntry.kind, folderPrompt.category).then(() =>
+                  void moveEntry(targetEntry, targetEntry.kind, folderPrompt.title).then(() =>
                     setFolderPrompt(null),
                   );
                 }}
@@ -1793,7 +2835,13 @@ export function Workspace({
           if (!open && !busy) setDeletion(null);
         }}
         title="确认删除"
-        description={`删除「${deletion?.title ?? ""}」？删除分卷不会删除其中章节。`}
+        description={
+          deletion?.kind === "volume"
+            ? `删除分卷「${deletion.title}」？其中的章节将保留为未分卷。`
+            : deletion?.kind === "folder"
+              ? `删除文件夹「${deletion.title}」？其中的条目将移出文件夹。`
+              : `将「${deletion?.title ?? ""}」移入回收站？可以在回收站中恢复。`
+        }
       >
         <Alert>{error}</Alert>
         <div className="dialog-actions">
@@ -1808,31 +2856,40 @@ export function Workspace({
                   if (editor.current?.dirty && selected?.id === item.id && !editor.current.stash())
                     throw new Error("请先保存草稿。");
                   await remove(item.path);
-                  if (selected?.id === item.id) setSelected(null);
+                  if (item.kind === "chapter" || item.kind === "entry") {
+                    setOpenTabs((prev) =>
+                      prev.filter((t) => !(t.kind === item.kind && t.id === item.id)),
+                    );
+                    if (selected?.id === item.id) setSelected(null);
+                  }
                   setDeletion(null);
                 });
             }}
           >
-            删除
+            {deletion?.kind === "chapter" || deletion?.kind === "entry" ? "移入回收站" : "删除"}
           </Button>
         </div>
       </Dialog>
 
       <Dialog
-        open={batchDeleteOpen}
+        open={trashConfirm !== null}
         onOpenChange={(open) => {
-          if (!open && !busy) setBatchDeleteOpen(false);
+          if (!open && !busy) setTrashConfirm(null);
         }}
-        title="批量删除设定"
-        description={`确定删除选中的 ${selectedEntryIds.length} 条设定吗？此操作无法撤销。`}
+        title={trashConfirm === "empty" ? "清空回收站" : "彻底删除"}
+        description={
+          trashConfirm === "empty"
+            ? `确定永久清除回收站中的全部 ${trashTotalCount} 个项目吗？此操作无法撤销。`
+            : `确定永久删除「${trashConfirm?.title ?? ""}」吗？此操作无法撤销。`
+        }
       >
         <Alert>{error}</Alert>
         <div className="dialog-actions">
-          <Button disabled={busy} onClick={() => setBatchDeleteOpen(false)}>
+          <Button disabled={busy} onClick={() => setTrashConfirm(null)}>
             取消
           </Button>
-          <Button variant="danger" disabled={busy} onClick={() => void applyBatchDelete()}>
-            确认删除
+          <Button variant="danger" disabled={busy} onClick={() => void confirmPurgeTrash()}>
+            确认清除
           </Button>
         </div>
       </Dialog>

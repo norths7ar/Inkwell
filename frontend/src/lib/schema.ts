@@ -16,6 +16,8 @@ export const bookSchema = z.object({
   default_visibility: visibilitySchema,
   updated_at: z.string(),
   cover_path: z.string().default(""),
+  chapter_count: z.number().default(0),
+  word_count: z.number().default(0),
 });
 export const volumeSchema = z.object({
   id: z.string(),
@@ -33,17 +35,38 @@ export const chapterSchema = z.object({
   summary: z.string(),
   word_count: z.number(),
   sort_order: z.number(),
+  created_at: z.string().default(""),
+  updated_at: z.string().default(""),
+  deleted_at: z.string().nullable().default(null),
 });
+export const entryKindSchema = z.enum(["character", "world", "outline", "note"]);
 export const entrySchema = z.object({
   id: z.string(),
   book_id: z.string(),
-  kind: z.enum(["character", "world", "note"]),
+  kind: entryKindSchema,
   title: z.string(),
   category: z.string(),
   content: z.string(),
   visibility: visibilitySchema,
   meta_json: z.string(),
   sort_order: z.number(),
+  created_at: z.string().default(""),
+  updated_at: z.string().default(""),
+  deleted_at: z.string().nullable().default(null),
+});
+export const entryFolderSchema = z.object({
+  id: z.string(),
+  book_id: z.string(),
+  kind: entryKindSchema,
+  title: z.string(),
+  description: z.string().default(""),
+  sort_order: z.number(),
+  created_at: z.string().default(""),
+  updated_at: z.string().default(""),
+});
+export const trashSchema = z.object({
+  chapters: z.array(chapterSchema),
+  entries: z.array(entrySchema),
 });
 export const pendingSchema = z.object({
   id: z.string(),
@@ -65,6 +88,7 @@ export const sessionSchema = z.object({
   title: z.string(),
   mode: modeSchema,
   visibility_scope: visibilitySchema,
+  pinned: z.boolean().default(false),
   created_at: z.string().default(""),
   updated_at: z.string().default(""),
 });
@@ -88,6 +112,8 @@ export const runSchema = z.object({
   output_tokens: z.number().default(0),
   cache_read_tokens: z.number().default(0),
   cache_write_tokens: z.number().default(0),
+  reasoning_effort: z.string().nullable().default(null),
+  reasoning_duration_ms: z.number().default(0),
   started_at: z.string(),
 });
 export const messageSchema = z.object({
@@ -100,7 +126,7 @@ export const messageSchema = z.object({
 });
 export const blockSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("text"), text: z.string() }),
-  z.object({ type: z.literal("reasoning"), text: z.string() }),
+  z.object({ type: z.literal("reasoning"), text: z.string(), duration_ms: z.number().optional() }),
   z.object({
     type: z.literal("tool_call"),
     call_id: z.string(),
@@ -167,14 +193,90 @@ export const searchSchema = z.object({
   title: z.string(),
   snippet: z.string(),
 });
+export const rollbackSchema = z.object({
+  session_id: z.string(),
+  message_id: z.string(),
+  user_text: z.string().nullable(),
+  deleted_messages: z.number(),
+  deleted_runs: z.number(),
+});
+export const compactionSummarySchema = z.object({
+  objective: z.string(),
+  facts: z.array(z.string()),
+  decisions: z.array(z.string()),
+  open_questions: z.array(z.string()),
+  next_steps: z.array(z.string()),
+});
+export const compactionSchema = z.object({
+  id: z.string(),
+  session_id: z.string(),
+  through_seq: z.number(),
+  summary: compactionSummarySchema,
+  model_id: z.string().nullable(),
+  input_tokens: z.number(),
+  output_tokens: z.number(),
+  created_at: z.string(),
+});
+export const batchChangesResultSchema = z.object({
+  changes: z.array(pendingSchema),
+  count: z.number(),
+});
+export const revisionSchema = z.object({
+  id: z.string(),
+  book_id: z.string(),
+  target_type: z.enum(["chapter", "entry"]),
+  target_id: z.string(),
+  source: z.enum(["user", "pending_apply", "restore"]),
+  pending_change_id: z.string().nullable(),
+  title: z.string(),
+  content: z.string(),
+  snapshot_json: z.string(),
+  created_at: z.string(),
+});
+export const restoreResultSchema = z.object({
+  target: z.union([chapterSchema, entrySchema]),
+  revision: revisionSchema,
+});
+export const backupRecordSchema = z.object({
+  name: z.string(),
+  size_bytes: z.number(),
+  created_at: z.string(),
+  kind: z.string().default("sqlite"),
+  includes_attachments: z.boolean().default(false),
+  includes_encryption_key: z.boolean().default(false),
+});
+export const systemStatusSchema = z.object({
+  data_dir: z.string(),
+  database_path: z.string(),
+  database_bytes: z.number(),
+  wal_bytes: z.number(),
+  attachments_bytes: z.number(),
+  backups_dir: z.string(),
+  backups: z.array(backupRecordSchema),
+  schema_version: z.number(),
+  host: z.string(),
+  port: z.number(),
+  uptime_seconds: z.number(),
+  books: z.number(),
+  sessions: z.number(),
+  running_runs: z.number(),
+  waiting_runs: z.number(),
+});
 export type Book = z.infer<typeof bookSchema>;
 export type Volume = z.infer<typeof volumeSchema>;
 export type Chapter = z.infer<typeof chapterSchema>;
+export type EntryKind = z.infer<typeof entryKindSchema>;
 export type Entry = z.infer<typeof entrySchema>;
+export type EntryFolder = z.infer<typeof entryFolderSchema>;
+export type TrashPayload = z.infer<typeof trashSchema>;
 export type PendingChange = z.infer<typeof pendingSchema>;
 export type Session = z.infer<typeof sessionSchema>;
 export type Run = z.infer<typeof runSchema>;
 export type Message = z.infer<typeof messageSchema>;
+export type Compaction = z.infer<typeof compactionSchema>;
+export type Revision = z.infer<typeof revisionSchema>;
+export type BackupRecord = z.infer<typeof backupRecordSchema>;
+export type SystemStatus = z.infer<typeof systemStatusSchema>;
 export type Provider = z.infer<typeof providerSchema>;
 export type Model = z.infer<typeof modelSchema>;
 export type Mode = z.infer<typeof modeSchema>;
@@ -195,6 +297,13 @@ export const eventSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("run_started"), ...ownership }),
   z.object({ type: z.literal("text_delta"), ...ownership, delta: z.string() }),
   z.object({ type: z.literal("reasoning_delta"), ...ownership, delta: z.string() }),
+  z.object({
+    type: z.literal("reasoning_completed"),
+    ...ownership,
+    iteration: z.number(),
+    block_index: z.number(),
+    duration_ms: z.number(),
+  }),
   z.object({
     type: z.literal("attempt_reset"),
     ...ownership,

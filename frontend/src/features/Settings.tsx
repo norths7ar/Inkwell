@@ -1,16 +1,26 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { z } from "zod";
 import {
+  Cable,
+  Check,
+  Copy,
   Cpu,
+  Download,
+  HardDrive,
   Lightbulb,
   MessageSquareCode,
   PenLine,
+  Pencil,
   Plus,
   RefreshCw,
   RotateCcw,
   ScrollText,
   SearchCheck,
   Trash2,
+  Type,
+  Upload,
+  X,
 } from "lucide-react";
 import {
   Alert,
@@ -20,10 +30,18 @@ import {
   EmptyState,
   Input,
   Select,
+  Switch,
   Textarea,
 } from "../components/ui";
-import { errorText, remove, request } from "../lib/api";
+import { errorText, remove, request, upload } from "../lib/api";
 import {
+  DEFAULT_EDITOR_PREFS,
+  loadEditorPrefs,
+  saveEditorPrefs,
+  type EditorPrefs,
+} from "../lib/editorPrefs";
+import {
+  backupRecordSchema,
   bookSchema,
   discoveredSchema,
   modelSchema,
@@ -32,9 +50,12 @@ import {
   protocolSchema,
   providerSchema,
   settingsSchema,
+  systemStatusSchema,
+  type BackupRecord,
   type Book,
   type Model,
   type Provider,
+  type SystemStatus,
 } from "../lib/schema";
 import "./settings.css";
 
@@ -42,33 +63,40 @@ type Preset = z.infer<typeof presetSchema>;
 type Prompt = z.infer<typeof promptSchema>;
 type GlobalSettings = z.infer<typeof settingsSchema>;
 type Discovered = z.infer<typeof discoveredSchema>;
+type SectionId = "providers" | "models" | "rules" | "prompts" | "editor" | "data";
+type SecretMode = "unchanged" | "editing" | "cleared";
+
 const protocols = protocolSchema.options.map((value) => ({ value, label: value }));
+
 const modeMeta = [
   {
     value: "discuss",
-    label: "讨论",
+    label: "讨论模式",
     icon: Lightbulb,
-    toolsHint: "可用工具：只读章节与设定、提出设定修改建议、向作者提问",
+    toolsHint: "适合头脑风暴与梳理设定：可阅读正文与设定，可提交设定修改建议，不会改写章节正文。",
   },
   {
     value: "write",
-    label: "写作",
+    label: "写作模式",
     icon: PenLine,
-    toolsHint: "可用工具：只读章节与设定、提交正文或设定待审修改、向作者提问",
+    toolsHint: "适合正文起草与润色：可阅读全书资料，修改正文或设定均进入待审区由你确认。",
   },
   {
     value: "review",
-    label: "审阅",
+    label: "审阅模式",
     icon: SearchCheck,
-    toolsHint: "可用工具：仅只读核查章节目录、正文、摘要、设定与搜索",
+    toolsHint: "适合校对与伏笔核查：严格只读全部章节与设定，不会提出或写入任何修改。",
   },
 ] as const;
 
-const sections = [
-  { value: "models", label: "模型与提供商", icon: Cpu },
+const sections: readonly { value: SectionId; label: string; icon: typeof Cable }[] = [
+  { value: "providers", label: "提供商", icon: Cable },
+  { value: "models", label: "模型", icon: Cpu },
   { value: "rules", label: "写作规则", icon: ScrollText },
-  { value: "prompts", label: "模式提示词", icon: MessageSquareCode },
-] as const;
+  { value: "prompts", label: "写作模式", icon: MessageSquareCode },
+  { value: "editor", label: "编辑与阅读", icon: Type },
+  { value: "data", label: "数据与服务", icon: HardDrive },
+];
 
 export function Settings({
   open,
@@ -84,7 +112,14 @@ export function Settings({
   books?: Book[];
 }) {
   return (
-    <Dialog open={open} onOpenChange={onOpenChange} title="设置" className="settings-dialog" wide>
+    <Dialog
+      open={open}
+      onOpenChange={onOpenChange}
+      title="设置"
+      hideHeader
+      className="settings-dialog"
+      wide
+    >
       {open && (
         <SettingsContent
           onSaved={onSaved}
@@ -105,16 +140,16 @@ function SettingsContent({
   activeBook: Book | null;
   books: Book[];
 }) {
-  const [tab, setTab] = useState<"models" | "rules" | "prompts">("models");
+  const [tab, setTab] = useState<SectionId>("providers");
   const [providers, setProviders] = useState<Provider[]>([]);
   const [models, setModels] = useState<Model[]>([]);
   const [presets, setPresets] = useState<Preset[]>([]);
   const [settings, setSettings] = useState<GlobalSettings | null>(null);
   const [prompts, setPrompts] = useState<Prompt[]>([]);
-  const [selected, setSelected] = useState("new");
+  const [selectedProviderId, setSelectedProviderId] = useState("new");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
-  const [deleting, setDeleting] = useState<Provider | null>(null);
+  const [deletingProvider, setDeletingProvider] = useState<Provider | null>(null);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -133,7 +168,7 @@ function SettingsContent({
         setPresets(nextPresets);
         setSettings(nextSettings);
         setPrompts(nextPrompts);
-        setSelected(nextProviders[0]?.id ?? "new");
+        setSelectedProviderId(nextProviders[0]?.id ?? "new");
         setLoading(false);
       })
       .catch((failure: unknown) => {
@@ -148,25 +183,37 @@ function SettingsContent({
   }, []);
 
   function providerSaved(provider: Provider) {
-    setProviders((items) => [...items.filter((item) => item.id !== provider.id), provider]);
-    setSelected(provider.id);
+    setProviders((items) => {
+      const exists = items.some((item) => item.id === provider.id);
+      return exists
+        ? items.map((item) => (item.id === provider.id ? provider : item))
+        : [...items, provider];
+    });
+    setSelectedProviderId(provider.id);
     onSaved();
   }
+
   function modelSaved(model: Model) {
-    setModels((items) => [...items.filter((item) => item.id !== model.id), model]);
+    setModels((items) => {
+      const exists = items.some((item) => item.id === model.id);
+      return exists
+        ? items.map((item) => (item.id === model.id ? model : item))
+        : [...items, model];
+    });
     onSaved();
   }
+
   async function deleteProvider() {
-    if (!deleting) return;
+    if (!deletingProvider) return;
     setBusy(true);
     setError("");
     try {
-      await remove(`/providers/${deleting.id}`);
-      const remaining = providers.filter((item) => item.id !== deleting.id);
+      await remove(`/providers/${deletingProvider.id}`);
+      const remaining = providers.filter((item) => item.id !== deletingProvider.id);
       setProviders(remaining);
-      setModels((items) => items.filter((item) => item.provider_id !== deleting.id));
-      setSelected(remaining[0]?.id ?? "new");
-      setDeleting(null);
+      setModels((items) => items.filter((item) => item.provider_id !== deletingProvider.id));
+      setSelectedProviderId(remaining[0]?.id ?? "new");
+      setDeletingProvider(null);
       onSaved();
     } catch (failure) {
       setError(errorText(failure));
@@ -174,7 +221,13 @@ function SettingsContent({
       setBusy(false);
     }
   }
-  const provider = providers.find((item) => item.id === selected);
+
+  const activeSection = sections.find((s) => s.value === tab) ?? {
+    value: "providers",
+    label: "提供商",
+    icon: Cable,
+  };
+  const selectedProvider = providers.find((item) => item.id === selectedProviderId);
   const enabledModels = models.filter(
     (model) =>
       model.enabled && providers.some((item) => item.id === model.provider_id && item.enabled),
@@ -183,126 +236,149 @@ function SettingsContent({
   return (
     <div className="settings-layout">
       <nav className="settings-navigation" aria-label="设置分类">
-        {sections.map((section) => {
-          const Icon = section.icon;
-          return (
-            <Button
-              key={section.value}
-              variant="ghost"
-              aria-current={tab === section.value ? "page" : undefined}
-              onClick={() => setTab(section.value)}
-            >
-              <Icon size={16} />
-              {section.label}
-            </Button>
-          );
-        })}
+        <div className="settings-sidebar-title">设置</div>
+        <div className="settings-sidebar-list">
+          {sections.map((section) => {
+            const Icon = section.icon;
+            return (
+              <button
+                key={section.value}
+                type="button"
+                className={`settings-nav-item ${tab === section.value ? "is-active" : ""}`}
+                aria-current={tab === section.value ? "page" : undefined}
+                onClick={() => setTab(section.value)}
+              >
+                <Icon size={16} />
+                <span>{section.label}</span>
+              </button>
+            );
+          })}
+        </div>
       </nav>
+
       <div className="settings-content">
+        <header className="settings-pane-header">
+          <h2>{activeSection.label}</h2>
+          <DialogPrimitive.Close asChild>
+            <Button variant="ghost" className="icon-control" aria-label="关闭设置">
+              <X size={17} />
+            </Button>
+          </DialogPrimitive.Close>
+        </header>
+
         <div className="settings-scroll">
           <Alert>{error}</Alert>
-          {loading && (
+          {loading ? (
             <p className="muted" role="status">
               正在读取设置…
             </p>
-          )}
-          {!loading && tab === "models" && (
-            <div className="stack">
-              {settings && (
-                <DefaultModelsCard
-                  initial={settings}
-                  models={enabledModels}
-                  onSaved={(value) => {
+          ) : (
+            <>
+              {tab === "providers" && (
+                <div className="providers-split">
+                  <div className="provider-list-pane" aria-label="提供商列表">
+                    <div className="provider-list-header">
+                      <span>已配置</span>
+                      <Button
+                        variant="ghost"
+                        className="icon-control"
+                        title="添加提供商"
+                        aria-label="添加提供商"
+                        onClick={() => setSelectedProviderId("new")}
+                      >
+                        <Plus size={15} />
+                      </Button>
+                    </div>
+                    {providers.map((item) => (
+                      <button
+                        type="button"
+                        key={item.id}
+                        className={`provider-list-item ${selectedProviderId === item.id ? "is-selected" : ""}`}
+                        onClick={() => setSelectedProviderId(item.id)}
+                      >
+                        <span
+                          className={`provider-dot ${item.enabled ? "" : "is-disabled"}`}
+                          aria-hidden="true"
+                        />
+                        <span>{item.name}</span>
+                      </button>
+                    ))}
+                    {selectedProviderId === "new" && (
+                      <button type="button" className="provider-list-item is-selected">
+                        <Plus size={14} />
+                        <span>新建提供商</span>
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="provider-detail-pane">
+                    <ProviderEditor
+                      key={selectedProviderId}
+                      provider={selectedProvider}
+                      presets={presets}
+                      onSaved={providerSaved}
+                      onDelete={
+                        selectedProvider ? () => setDeletingProvider(selectedProvider) : undefined
+                      }
+                    />
+                  </div>
+                </div>
+              )}
+
+              {tab === "models" && (
+                <ModelsSection
+                  providers={providers}
+                  models={models}
+                  enabledModels={enabledModels}
+                  settings={settings}
+                  onSettingsSaved={(value) => {
                     setSettings(value);
+                    onSaved();
+                  }}
+                  onModelSaved={modelSaved}
+                  onModelDeleted={(id) => {
+                    setModels((items) => items.filter((item) => item.id !== id));
                     onSaved();
                   }}
                 />
               )}
-              <div className="providers-master-detail">
-                <div className="provider-list-pane" aria-label="提供商列表">
-                  <div className="provider-list-header">
-                    <span>提供商</span>
-                    <Button
-                      variant="ghost"
-                      className="icon-control"
-                      title="新建提供商"
-                      aria-label="新建提供商"
-                      onClick={() => setSelected("new")}
-                    >
-                      <Plus size={15} />
-                    </Button>
-                  </div>
-                  {providers.map((item) => (
-                    <button
-                      type="button"
-                      key={item.id}
-                      className={`provider-list-item ${selected === item.id ? "is-selected" : ""}`}
-                      onClick={() => setSelected(item.id)}
-                    >
-                      <span
-                        className={`provider-dot ${item.enabled ? "" : "is-disabled"}`}
-                        aria-hidden="true"
-                      />
-                      <span>{item.name}</span>
-                    </button>
-                  ))}
-                  {selected === "new" && (
-                    <button type="button" className="provider-list-item is-selected">
-                      <Plus size={14} />
-                      <span>新建提供商</span>
-                    </button>
-                  )}
-                </div>
-                <div className="provider-detail-pane">
-                  <ProviderEditor
-                    key={selected}
-                    provider={provider}
-                    presets={presets}
-                    onSaved={providerSaved}
-                    onDelete={provider ? () => setDeleting(provider) : undefined}
-                  />
-                  {provider && (
-                    <ModelsPanel
-                      key={`models-${provider.id}`}
-                      provider={provider}
-                      models={models.filter((item) => item.provider_id === provider.id)}
-                      onSaved={modelSaved}
-                      onDeleted={(id) => {
-                        setModels((items) => items.filter((item) => item.id !== id));
-                        onSaved();
-                      }}
-                    />
-                  )}
-                </div>
-              </div>
-            </div>
+
+              {tab === "rules" && settings && (
+                <RulesSection
+                  settings={settings}
+                  activeBook={activeBook}
+                  books={books}
+                  onSettingsSaved={(value) => {
+                    setSettings(value);
+                    onSaved();
+                  }}
+                  onBookSaved={onSaved}
+                />
+              )}
+
+              {tab === "prompts" && <PromptEditor initial={prompts} onSaved={onSaved} />}
+
+              {tab === "editor" && <EditorPrefsSection />}
+
+              {tab === "data" && (
+                <DataServicePanel activeBook={activeBook} books={books} onBookImported={onSaved} />
+              )}
+            </>
           )}
-          {!loading && tab === "rules" && settings && (
-            <RulesSection
-              settings={settings}
-              activeBook={activeBook}
-              books={books}
-              onSettingsSaved={(value) => {
-                setSettings(value);
-                onSaved();
-              }}
-              onBookSaved={onSaved}
-            />
-          )}
-          {!loading && tab === "prompts" && <PromptEditor initial={prompts} onSaved={onSaved} />}
         </div>
       </div>
+
       <Dialog
-        open={deleting !== null}
+        open={deletingProvider !== null}
         onOpenChange={(value) => {
-          if (!value && !busy) setDeleting(null);
+          if (!value && !busy) setDeletingProvider(null);
         }}
         title="删除提供商"
-        description={`确定删除「${deleting?.name ?? ""}」及其下的模型配置吗？不会影响作品与对话记录。`}
+        description={`确定删除「${deletingProvider?.name ?? ""}」及其下的模型配置吗？不会影响作品与对话记录。`}
       >
         <Alert>{error}</Alert>
         <div className="dialog-actions">
-          <Button disabled={busy} onClick={() => setDeleting(null)}>
+          <Button disabled={busy} onClick={() => setDeletingProvider(null)}>
             取消
           </Button>
           <Button variant="danger" disabled={busy} onClick={() => void deleteProvider()}>
@@ -311,71 +387,6 @@ function SettingsContent({
         </div>
       </Dialog>
     </div>
-  );
-}
-
-function DefaultModelsCard({
-  initial,
-  models,
-  onSaved,
-}: {
-  initial: GlobalSettings;
-  models: Model[];
-  onSaved: (settings: GlobalSettings) => void;
-}) {
-  const [primary, setPrimary] = useState(initial.default_model_id ?? "none");
-  const [background, setBackground] = useState(initial.background_model_id ?? "none");
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState("");
-  const options = [
-    { value: "none", label: "未设置" },
-    ...models.map((model) => ({ value: model.id, label: model.display_name || model.model_id })),
-  ];
-  async function save(event: FormEvent) {
-    event.preventDefault();
-    setSaving(true);
-    setError("");
-    try {
-      const result = await request("/settings", settingsSchema, {
-        method: "PATCH",
-        body: {
-          default_model_id: primary === "none" ? null : primary,
-          background_model_id: background === "none" ? null : background,
-          global_rules_markdown: initial.global_rules_markdown,
-        },
-      });
-      onSaved(result);
-    } catch (failure) {
-      setError(errorText(failure));
-    } finally {
-      setSaving(false);
-    }
-  }
-  return (
-    <form className="settings-card" onSubmit={(event) => void save(event)}>
-      <div className="settings-card-header">
-        <div className="settings-card-title">
-          <h3>默认模型</h3>
-        </div>
-      </div>
-      <div className="settings-defaults-bar">
-        <Select label="主写作模型" value={primary} onChange={setPrimary} options={options} />
-        <Select
-          label="后台轻量模型"
-          value={background}
-          onChange={setBackground}
-          options={options}
-        />
-        <Button type="submit" variant="primary" disabled={saving}>
-          {saving ? "保存中…" : "保存默认模型"}
-        </Button>
-      </div>
-      {((primary !== "none" && !models.some((model) => model.id === primary)) ||
-        (background !== "none" && !models.some((model) => model.id === background))) && (
-        <Alert>所选模型已停用或删除，请重新选择。</Alert>
-      )}
-      <Alert>{error}</Alert>
-    </form>
   );
 }
 
@@ -396,12 +407,34 @@ function ProviderEditor({
   const [discoveryUrl, setDiscoveryUrl] = useState(provider?.discovery_url ?? "");
   const [protocol, setProtocol] = useState(provider?.default_protocol ?? "openai-chat");
   const [enabled, setEnabled] = useState(provider?.enabled ?? true);
+
+  const [keyMode, setKeyMode] = useState<SecretMode>(
+    provider?.api_key_configured ? "unchanged" : "editing",
+  );
   const [apiKey, setApiKey] = useState("");
+  const [headersMode, setHeadersMode] = useState<SecretMode>(
+    provider?.headers_configured ? "unchanged" : "editing",
+  );
   const [headers, setHeaders] = useState("");
-  const [clearKey, setClearKey] = useState(false);
-  const [clearHeaders, setClearHeaders] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [savedNotice, setSavedNotice] = useState(false);
   const [error, setError] = useState("");
+
+  const presetLabel =
+    presets.find((item) => item.id === (provider?.preset || preset))?.name ?? "自定义";
+
+  const isDirty = !provider
+    ? Boolean(name.trim() || baseUrl.trim() || apiKey.trim() || headers.trim())
+    : name.trim() !== provider.name ||
+      baseUrl.trim() !== provider.base_url ||
+      discoveryUrl.trim() !== provider.discovery_url ||
+      protocol !== provider.default_protocol ||
+      enabled !== provider.enabled ||
+      keyMode === "cleared" ||
+      (keyMode === "editing" && apiKey.length > 0) ||
+      headersMode === "cleared" ||
+      (headersMode === "editing" && headers.trim().length > 0);
+
   function choosePreset(value: string) {
     const chosen = presets.find((item) => item.id === value);
     setPreset(value);
@@ -411,15 +444,19 @@ function ProviderEditor({
       setProtocol(chosen.default_protocol);
       if (!name.trim()) setName(chosen.name);
     }
+    setSavedNotice(false);
   }
+
   async function save(event: FormEvent) {
     event.preventDefault();
     setSaving(true);
     setError("");
+    setSavedNotice(false);
     try {
       let parsedHeaders: Record<string, string> | undefined;
-      if (clearHeaders) parsedHeaders = {};
-      else if (headers.trim()) {
+      if (headersMode === "cleared") {
+        parsedHeaders = {};
+      } else if (headersMode === "editing" && headers.trim()) {
         try {
           const raw: unknown = JSON.parse(headers);
           parsedHeaders = z.record(z.string(), z.string()).parse(raw);
@@ -427,6 +464,7 @@ function ProviderEditor({
           throw new Error("自定义请求头必须是 JSON 对象，且每个值都是文本。");
         }
       }
+
       const saved = await request(
         provider ? `/providers/${provider.id}` : "/providers",
         providerSchema,
@@ -439,15 +477,20 @@ function ProviderEditor({
             discovery_url: discoveryUrl.trim(),
             default_protocol: protocol,
             enabled,
-            ...(clearKey ? { api_key: "" } : apiKey ? { api_key: apiKey } : {}),
+            ...(keyMode === "cleared"
+              ? { api_key: "" }
+              : keyMode === "editing" && apiKey
+                ? { api_key: apiKey }
+                : {}),
             ...(parsedHeaders === undefined ? {} : { headers: parsedHeaders }),
           },
         },
       );
       setApiKey("");
       setHeaders("");
-      setClearKey(false);
-      setClearHeaders(false);
+      setKeyMode(saved.api_key_configured ? "unchanged" : "editing");
+      setHeadersMode(saved.headers_configured ? "unchanged" : "editing");
+      setSavedNotice(true);
       onSaved(saved);
     } catch (failure) {
       setError(errorText(failure));
@@ -455,20 +498,30 @@ function ProviderEditor({
       setSaving(false);
     }
   }
+
   return (
-    <form className="settings-card" onSubmit={(event) => void save(event)}>
-      <div className="settings-card-header">
-        <div className="settings-card-title">
+    <form className="settings-section-form" onSubmit={(event) => void save(event)}>
+      <div className="settings-section-bar">
+        <div className="row">
           <h3>{provider ? provider.name : "新建提供商"}</h3>
+          {provider && <Badge>{presetLabel}</Badge>}
         </div>
         <div className="row">
-          <Button
-            variant="secondary"
-            disabled={saving}
-            onClick={() => setEnabled((value) => !value)}
-          >
-            {enabled ? "已启用" : "已停用"}
-          </Button>
+          {savedNotice && !isDirty && <Badge tone="success">已保存</Badge>}
+          {provider && (
+            <div className="switch-field">
+              <span className="muted">{enabled ? "已启用" : "已停用"}</span>
+              <Switch
+                checked={enabled}
+                disabled={saving}
+                label={enabled ? "停用提供商" : "启用提供商"}
+                onCheckedChange={(checked) => {
+                  setEnabled(checked);
+                  setSavedNotice(false);
+                }}
+              />
+            </div>
+          )}
           {onDelete && (
             <Button
               variant="ghost"
@@ -481,104 +534,387 @@ function ProviderEditor({
               <Trash2 size={15} />
             </Button>
           )}
-          <Button type="submit" variant="primary" disabled={saving}>
-            {saving ? "保存中…" : "保存提供商"}
+          <Button type="submit" variant="primary" disabled={saving || !isDirty}>
+            {saving ? "保存中…" : "保存"}
           </Button>
         </div>
       </div>
-      <div className="settings-grid-3">
-        <Input
-          label="名称"
-          value={name}
-          onChange={(event) => setName(event.target.value)}
-          required
-          placeholder="例如：OpenAI"
-        />
+
+      {!provider && (
         <Select
-          label="提供商预设"
+          label="服务预设（自动填充连接参数）"
           value={preset}
           onChange={choosePreset}
           options={presets.map((item) => ({ value: item.id, label: item.name }))}
         />
-        <Select
-          label="默认协议"
-          value={protocol}
-          onChange={(value) => setProtocol(protocolSchema.parse(value))}
-          options={protocols}
-        />
-      </div>
-      <div className="settings-grid-2-wide">
-        <Input
-          label="API 地址"
-          type="url"
-          value={baseUrl}
-          onChange={(event) => setBaseUrl(event.target.value)}
-          required
-          placeholder="https://…/v1"
-        />
-        <Input
-          label="模型发现地址（可选）"
-          type="url"
-          value={discoveryUrl}
-          onChange={(event) => setDiscoveryUrl(event.target.value)}
-          placeholder="留空则使用 API 地址 /models"
-        />
-      </div>
-      <div className="credential-row">
-        <Input
-          label="API Key（留空保留现有密钥）"
-          type="password"
-          autoComplete="new-password"
-          value={apiKey}
-          disabled={clearKey}
-          onChange={(event) => setApiKey(event.target.value)}
-        />
-        <Badge tone={provider?.api_key_configured ? "success" : "neutral"}>
-          {provider?.api_key_configured ? "已配置密钥" : "未配置密钥"}
-        </Badge>
-        {provider?.api_key_configured && (
-          <Button
-            variant={clearKey ? "danger" : "secondary"}
-            aria-pressed={clearKey}
-            onClick={() => setClearKey((value) => !value)}
-          >
-            {clearKey ? "撤销清除" : "清除密钥"}
-          </Button>
+      )}
+
+      <Input
+        label="名称"
+        value={name}
+        onChange={(event) => {
+          setName(event.target.value);
+          setSavedNotice(false);
+        }}
+        required
+        placeholder="例如：DeepSeek"
+      />
+
+      <div className="secret-field">
+        <span className="secret-field-label">API Key</span>
+        {keyMode === "unchanged" ? (
+          <div className="secret-saved-bar">
+            <span className="secret-status">
+              <span className="secret-dot is-ok" aria-hidden="true" />
+              <span>已配置密钥 · ••••••••</span>
+            </span>
+            <div className="row">
+              <Button
+                onClick={() => {
+                  setKeyMode("editing");
+                  setApiKey("");
+                  setSavedNotice(false);
+                }}
+              >
+                更换密钥
+              </Button>
+              <Button
+                variant="ghost"
+                onClick={() => {
+                  setKeyMode("cleared");
+                  setApiKey("");
+                  setSavedNotice(false);
+                }}
+              >
+                移除
+              </Button>
+            </div>
+          </div>
+        ) : keyMode === "cleared" ? (
+          <div className="secret-saved-bar is-clearing">
+            <span className="secret-status">将在点击保存后移除已保存的密钥</span>
+            <Button
+              variant="ghost"
+              onClick={() => {
+                setKeyMode("unchanged");
+                setSavedNotice(false);
+              }}
+            >
+              撤销
+            </Button>
+          </div>
+        ) : (
+          <div className="secret-input-row">
+            <Input
+              type="password"
+              autoComplete="new-password"
+              aria-label="API Key"
+              placeholder={provider?.api_key_configured ? "输入新的 API Key…" : "粘贴 API Key…"}
+              value={apiKey}
+              onChange={(event) => {
+                setApiKey(event.target.value);
+                setSavedNotice(false);
+              }}
+            />
+            {apiKey && (
+              <Button variant="ghost" onClick={() => setApiKey("")}>
+                清空输入
+              </Button>
+            )}
+            {provider?.api_key_configured && (
+              <Button
+                variant="ghost"
+                onClick={() => {
+                  setKeyMode("unchanged");
+                  setApiKey("");
+                }}
+              >
+                取消更换
+              </Button>
+            )}
+          </div>
         )}
       </div>
-      <details className="settings-advanced">
-        <summary>
-          高级选项：自定义请求头（{provider?.headers_configured ? "已配置" : "未配置"}）
-        </summary>
-        <div className="stack">
-          <Textarea
-            label="自定义请求头（JSON；留空保留现有配置）"
-            value={headers}
-            disabled={clearHeaders}
-            onChange={(event) => setHeaders(event.target.value)}
-            rows={3}
-            placeholder={'{"X-Custom-Header": "value"}'}
-            spellCheck={false}
+
+      {!provider && (
+        <div className="settings-grid-2">
+          <Input
+            label="API 地址"
+            type="url"
+            value={baseUrl}
+            onChange={(event) => {
+              setBaseUrl(event.target.value);
+              setSavedNotice(false);
+            }}
+            required
+            placeholder="https://…/v1"
           />
-          {provider?.headers_configured && (
-            <Button
-              className="credential-action"
-              variant={clearHeaders ? "danger" : "secondary"}
-              aria-pressed={clearHeaders}
-              onClick={() => setClearHeaders((value) => !value)}
-            >
-              {clearHeaders ? "撤销清除请求头" : "保存时清除请求头"}
-            </Button>
+          <Select
+            label="默认协议"
+            value={protocol}
+            onChange={(value) => {
+              setProtocol(protocolSchema.parse(value));
+              setSavedNotice(false);
+            }}
+            options={protocols}
+          />
+        </div>
+      )}
+
+      <details className="settings-advanced" open={!provider}>
+        <summary>高级连接选项</summary>
+        <div className="stack">
+          {provider && (
+            <div className="settings-grid-2">
+              <Input
+                label="API 地址"
+                type="url"
+                value={baseUrl}
+                onChange={(event) => {
+                  setBaseUrl(event.target.value);
+                  setSavedNotice(false);
+                }}
+                required
+                placeholder="https://…/v1"
+              />
+              <Select
+                label="默认协议"
+                value={protocol}
+                onChange={(value) => {
+                  setProtocol(protocolSchema.parse(value));
+                  setSavedNotice(false);
+                }}
+                options={protocols}
+              />
+            </div>
           )}
+          <Input
+            label="模型发现地址（可选）"
+            type="url"
+            value={discoveryUrl}
+            onChange={(event) => {
+              setDiscoveryUrl(event.target.value);
+              setSavedNotice(false);
+            }}
+            placeholder="留空则使用 API 地址 /models"
+          />
+          <div className="secret-field">
+            <span className="secret-field-label">自定义请求头</span>
+            {headersMode === "unchanged" ? (
+              <div className="secret-saved-bar">
+                <span className="secret-status">
+                  <span className="secret-dot is-ok" aria-hidden="true" />
+                  <span>已配置自定义请求头</span>
+                </span>
+                <div className="row">
+                  <Button
+                    onClick={() => {
+                      setHeadersMode("editing");
+                      setHeaders("");
+                      setSavedNotice(false);
+                    }}
+                  >
+                    更换
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    onClick={() => {
+                      setHeadersMode("cleared");
+                      setHeaders("");
+                      setSavedNotice(false);
+                    }}
+                  >
+                    移除
+                  </Button>
+                </div>
+              </div>
+            ) : headersMode === "cleared" ? (
+              <div className="secret-saved-bar is-clearing">
+                <span className="secret-status">将在点击保存后清除自定义请求头</span>
+                <Button
+                  variant="ghost"
+                  onClick={() => {
+                    setHeadersMode("unchanged");
+                    setSavedNotice(false);
+                  }}
+                >
+                  撤销
+                </Button>
+              </div>
+            ) : (
+              <div className="stack">
+                <Textarea
+                  aria-label="自定义请求头"
+                  value={headers}
+                  onChange={(event) => {
+                    setHeaders(event.target.value);
+                    setSavedNotice(false);
+                  }}
+                  rows={3}
+                  placeholder={'{"X-Custom-Header": "value"}'}
+                  spellCheck={false}
+                />
+                {provider?.headers_configured && (
+                  <div className="row end">
+                    <Button
+                      variant="ghost"
+                      onClick={() => {
+                        setHeadersMode("unchanged");
+                        setHeaders("");
+                      }}
+                    >
+                      取消更换
+                    </Button>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </div>
       </details>
-      {(clearKey || clearHeaders) && <Badge tone="warning">将于保存时清除所选凭据</Badge>}
+
       <Alert>{error}</Alert>
     </form>
   );
 }
 
-function ModelsPanel({
+function ModelsSection({
+  providers,
+  models,
+  enabledModels,
+  settings,
+  onSettingsSaved,
+  onModelSaved,
+  onModelDeleted,
+}: {
+  providers: Provider[];
+  models: Model[];
+  enabledModels: Model[];
+  settings: GlobalSettings | null;
+  onSettingsSaved: (settings: GlobalSettings) => void;
+  onModelSaved: (model: Model) => void;
+  onModelDeleted: (id: string) => void;
+}) {
+  return (
+    <div className="settings-sections">
+      {settings && (
+        <DefaultModelsBlock initial={settings} models={enabledModels} onSaved={onSettingsSaved} />
+      )}
+      <hr className="settings-divider" />
+      {providers.length === 0 ? (
+        <EmptyState title="尚未配置提供商">
+          请先在「提供商」中添加并启用至少一个 API 连接。
+        </EmptyState>
+      ) : (
+        <div className="settings-sections">
+          {providers.map((provider, index) => (
+            <div key={provider.id}>
+              {index > 0 && <hr className="settings-divider" />}
+              <ProviderModelsBlock
+                provider={provider}
+                models={models.filter((item) => item.provider_id === provider.id)}
+                onSaved={onModelSaved}
+                onDeleted={onModelDeleted}
+              />
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DefaultModelsBlock({
+  initial,
+  models,
+  onSaved,
+}: {
+  initial: GlobalSettings;
+  models: Model[];
+  onSaved: (settings: GlobalSettings) => void;
+}) {
+  const [primary, setPrimary] = useState(initial.default_model_id ?? "none");
+  const [background, setBackground] = useState(initial.background_model_id ?? "none");
+  const [saving, setSaving] = useState(false);
+  const [savedNotice, setSavedNotice] = useState(false);
+  const [error, setError] = useState("");
+
+  const isDirty =
+    primary !== (initial.default_model_id ?? "none") ||
+    background !== (initial.background_model_id ?? "none");
+
+  const options = [
+    { value: "none", label: "未设置" },
+    ...models.map((model) => ({ value: model.id, label: model.display_name || model.model_id })),
+  ];
+
+  async function save(event: FormEvent) {
+    event.preventDefault();
+    setSaving(true);
+    setError("");
+    setSavedNotice(false);
+    try {
+      const result = await request("/settings", settingsSchema, {
+        method: "PATCH",
+        body: {
+          default_model_id: primary === "none" ? null : primary,
+          background_model_id: background === "none" ? null : background,
+          global_rules_markdown: initial.global_rules_markdown,
+        },
+      });
+      setSavedNotice(true);
+      onSaved(result);
+    } catch (failure) {
+      setError(errorText(failure));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <form className="settings-block" onSubmit={(event) => void save(event)}>
+      <div className="settings-section-bar">
+        <div>
+          <h3>默认模型</h3>
+          <p className="muted">主写作模型用于对话与创作；后台模型用于生成标题与压缩上下文。</p>
+        </div>
+        <div className="row">
+          {savedNotice && !isDirty && <Badge tone="success">已保存</Badge>}
+          <Button type="submit" variant="primary" disabled={saving || !isDirty}>
+            {saving ? "保存中…" : "保存"}
+          </Button>
+        </div>
+      </div>
+      <div className="settings-defaults-bar">
+        <Select
+          label="主写作模型"
+          value={primary}
+          onChange={(v) => {
+            setPrimary(v);
+            setSavedNotice(false);
+          }}
+          options={options}
+        />
+        <Select
+          label="后台轻量模型"
+          value={background}
+          onChange={(v) => {
+            setBackground(v);
+            setSavedNotice(false);
+          }}
+          options={options}
+        />
+      </div>
+      {((primary !== "none" && !models.some((model) => model.id === primary)) ||
+        (background !== "none" && !models.some((model) => model.id === background))) && (
+        <Alert>所选默认模型已停用或删除，请重新选择。</Alert>
+      )}
+      <Alert>{error}</Alert>
+    </form>
+  );
+}
+
+function ProviderModelsBlock({
   provider,
   models,
   onSaved,
@@ -592,18 +928,20 @@ function ModelsPanel({
   const [editing, setEditing] = useState<Model | "new" | null>(null);
   const [deleting, setDeleting] = useState<Model | null>(null);
   const [discovered, setDiscovered] = useState<Discovered[] | null>(null);
+  const [discoverFilter, setDiscoverFilter] = useState("");
   const [selected, setSelected] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+
   async function discover() {
     setBusy(true);
     setError("");
     try {
-      setDiscovered(
-        await request(`/providers/${provider.id}/discover`, discoveredSchema.array(), {
-          method: "POST",
-        }),
-      );
+      const list = await request(`/providers/${provider.id}/discover`, discoveredSchema.array(), {
+        method: "POST",
+      });
+      setDiscovered(list);
+      setDiscoverFilter("");
       setSelected([]);
     } catch (failure) {
       setError(errorText(failure));
@@ -611,6 +949,7 @@ function ModelsPanel({
       setBusy(false);
     }
   }
+
   async function importModels() {
     setBusy(true);
     setError("");
@@ -619,21 +958,46 @@ function ModelsPanel({
         if (
           !selected.includes(model.model_id) ||
           models.some((item) => item.model_id === model.model_id)
-        )
+        ) {
           continue;
+        }
         const saved = await request(`/providers/${provider.id}/models`, modelSchema, {
           method: "POST",
           body: { model_id: model.model_id, display_name: model.display_name },
         });
         onSaved(saved);
-        setSelected((items) => items.filter((item) => item !== model.model_id));
       }
+      setDiscovered(null);
+      setSelected([]);
     } catch (failure) {
       setError(errorText(failure));
     } finally {
       setBusy(false);
     }
   }
+
+  async function toggleModelEnabled(model: Model, nextEnabled: boolean) {
+    setBusy(true);
+    setError("");
+    try {
+      const saved = await request(`/models/${model.id}`, modelSchema, {
+        method: "PATCH",
+        body: {
+          display_name: model.display_name,
+          protocol_override: model.protocol_override,
+          context_window: model.context_window,
+          max_output_tokens: model.max_output_tokens,
+          enabled: nextEnabled,
+        },
+      });
+      onSaved(saved);
+    } catch (failure) {
+      setError(errorText(failure));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function deleteModel() {
     if (!deleting) return;
     setBusy(true);
@@ -648,76 +1012,134 @@ function ModelsPanel({
       setBusy(false);
     }
   }
+
+  const filteredDiscovered = useMemo(() => {
+    if (!discovered) return [];
+    const q = discoverFilter.trim().toLowerCase();
+    return q
+      ? discovered.filter(
+          (m) => m.model_id.toLowerCase().includes(q) || m.display_name.toLowerCase().includes(q),
+        )
+      : discovered;
+  }, [discovered, discoverFilter]);
+
   return (
-    <section className="settings-card">
-      <div className="settings-card-header">
-        <div className="settings-card-title">
-          <h3>模型目录</h3>
+    <section className="settings-block">
+      <div className="settings-section-bar">
+        <div className="row">
+          <span
+            className={`provider-dot ${provider.enabled ? "" : "is-disabled"}`}
+            aria-hidden="true"
+          />
+          <h3>{provider.name}</h3>
+          {!provider.enabled && <span className="muted">· 已停用</span>}
         </div>
         <div className="row">
-          <Button onClick={() => setEditing("new")}>
-            <Plus size={15} />
-            手动添加
-          </Button>
           <Button disabled={busy} onClick={() => void discover()}>
-            <RefreshCw size={15} />
+            <RefreshCw size={14} />
             发现模型
+          </Button>
+          <Button onClick={() => setEditing("new")}>
+            <Plus size={14} />
+            手动添加
           </Button>
         </div>
       </div>
+
       <Alert>{error}</Alert>
-      {models.length === 0 && <EmptyState title="暂无模型" />}
-      <div className="stack">
-        {models.map((model) => (
-          <div className="row model-row" key={model.id}>
-            <div className="model-description">
-              <strong>{model.display_name || model.model_id}</strong>
-              <div className="muted">{model.model_id}</div>
-            </div>
-            <Badge>{model.protocol_override ?? "继承提供商协议"}</Badge>
-            {!model.enabled && <Badge tone="warning">已停用</Badge>}
-            <Button variant="ghost" onClick={() => setEditing(model)}>
-              编辑
-            </Button>
-            <Button
-              variant="ghost"
-              aria-label={`删除模型 ${model.model_id}`}
-              onClick={() => setDeleting(model)}
-            >
-              <Trash2 size={16} />
-            </Button>
-          </div>
-        ))}
-      </div>
-      {discovered !== null && (
-        <section className="stack discovery-preview">
-          <h4>发现预览 · {discovered.length} 个模型</h4>
-          <div className="row">
-            <Button
-              disabled={busy}
-              onClick={() =>
-                setSelected(
-                  discovered
-                    .filter((model) => !models.some((item) => item.model_id === model.model_id))
-                    .map((model) => model.model_id),
-                )
-              }
-            >
-              选中全部新模型
-            </Button>
-            <Button variant="ghost" disabled={busy} onClick={() => setSelected([])}>
-              清空选择
-            </Button>
-          </div>
-          <div className="discovery-list">
-            {discovered.map((model) => {
-              const exists = models.some((item) => item.model_id === model.model_id);
-              return (
+
+      {models.length === 0 ? (
+        <p className="muted">尚未导入模型，点击右上角「发现模型」或「手动添加」。</p>
+      ) : (
+        <div className="flat-list">
+          {models.map((model) => (
+            <div className="flat-list-row" key={model.id}>
+              <div className="flat-list-main">
+                <div className="row">
+                  <strong>{model.display_name || model.model_id}</strong>
+                  {model.protocol_override && <Badge>{model.protocol_override}</Badge>}
+                </div>
+                <span className="muted">
+                  {model.model_id}
+                  {model.context_window ? ` · ${model.context_window.toLocaleString()} ctx` : ""}
+                </span>
+              </div>
+              <div className="row">
+                <Switch
+                  checked={model.enabled}
+                  disabled={busy}
+                  label={`${model.enabled ? "停用" : "启用"} ${model.display_name || model.model_id}`}
+                  onCheckedChange={(checked) => void toggleModelEnabled(model, checked)}
+                />
                 <Button
+                  variant="ghost"
+                  className="icon-control"
+                  title="编辑模型"
+                  aria-label={`编辑模型 ${model.model_id}`}
+                  onClick={() => setEditing(model)}
+                >
+                  <Pencil size={14} />
+                </Button>
+                <Button
+                  variant="ghost"
+                  className="icon-control"
+                  title="删除模型"
+                  aria-label={`删除模型 ${model.model_id}`}
+                  onClick={() => setDeleting(model)}
+                >
+                  <Trash2 size={14} />
+                </Button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <Dialog
+        open={discovered !== null}
+        onOpenChange={(value) => {
+          if (!value && !busy) setDiscovered(null);
+        }}
+        title={`发现模型 · ${provider.name}`}
+      >
+        <div className="stack">
+          <Input
+            placeholder="筛选模型 ID 或名称…"
+            aria-label="筛选发现的模型"
+            value={discoverFilter}
+            onChange={(event) => setDiscoverFilter(event.target.value)}
+          />
+          <div className="row spread">
+            <span className="muted">共发现 {discovered?.length ?? 0} 个模型</span>
+            <div className="row">
+              <Button
+                variant="ghost"
+                disabled={busy || !discovered}
+                onClick={() =>
+                  setSelected(
+                    (discovered ?? [])
+                      .filter((model) => !models.some((item) => item.model_id === model.model_id))
+                      .map((model) => model.model_id),
+                  )
+                }
+              >
+                全选新模型
+              </Button>
+              <Button variant="ghost" disabled={busy} onClick={() => setSelected([])}>
+                清空
+              </Button>
+            </div>
+          </div>
+          <div className="discovery-modal-list">
+            {filteredDiscovered.map((model) => {
+              const exists = models.some((item) => item.model_id === model.model_id);
+              const checked = selected.includes(model.model_id);
+              return (
+                <button
+                  type="button"
                   key={model.model_id}
                   disabled={exists || busy}
-                  aria-pressed={selected.includes(model.model_id)}
-                  variant={selected.includes(model.model_id) ? "primary" : "secondary"}
+                  className={`discovery-pick-item ${checked ? "is-checked" : ""}`}
                   onClick={() =>
                     setSelected((items) =>
                       items.includes(model.model_id)
@@ -726,14 +1148,23 @@ function ModelsPanel({
                     )
                   }
                 >
-                  {model.display_name || model.model_id}
-                  {exists ? " · 已导入" : ""}
-                </Button>
+                  <span className="discovery-check" aria-hidden="true">
+                    {exists || checked ? <Check size={13} /> : null}
+                  </span>
+                  <div className="discovery-pick-text">
+                    <strong>{model.display_name || model.model_id}</strong>
+                    <span>{model.model_id}</span>
+                  </div>
+                  {exists && <Badge>已导入</Badge>}
+                </button>
               );
             })}
+            {filteredDiscovered.length === 0 && <p className="muted">没有匹配的模型</p>}
           </div>
-          {discovered.length === 0 && <p className="muted">未发现模型</p>}
-          <div className="row">
+          <div className="dialog-actions">
+            <Button disabled={busy} onClick={() => setDiscovered(null)}>
+              关闭
+            </Button>
             <Button
               variant="primary"
               disabled={busy || selected.length === 0}
@@ -741,12 +1172,10 @@ function ModelsPanel({
             >
               导入选中（{selected.length}）
             </Button>
-            <Button variant="ghost" disabled={busy} onClick={() => setDiscovered(null)}>
-              关闭预览
-            </Button>
           </div>
-        </section>
-      )}
+        </div>
+      </Dialog>
+
       <Dialog
         open={editing !== null}
         onOpenChange={(value) => {
@@ -767,6 +1196,7 @@ function ModelsPanel({
           />
         )}
       </Dialog>
+
       <Dialog
         open={deleting !== null}
         onOpenChange={(value) => {
@@ -813,6 +1243,7 @@ function ModelEditor({
   const [enabled, setEnabled] = useState(initial?.enabled ?? true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+
   async function save(event: FormEvent) {
     event.preventDefault();
     setBusy(true);
@@ -844,6 +1275,7 @@ function ModelEditor({
       setBusy(false);
     }
   }
+
   return (
     <form className="model-form" onSubmit={(event) => void save(event)}>
       <div className="stack model-form-scroll">
@@ -865,7 +1297,7 @@ function ModelEditor({
           onChange={setProtocol}
           options={[{ value: "inherit", label: "继承提供商默认协议" }, ...protocols]}
         />
-        <div className="settings-grid">
+        <div className="settings-grid-2">
           <Input
             label="上下文窗口（可选）"
             type="number"
@@ -883,15 +1315,10 @@ function ModelEditor({
             onChange={(event) => setOutput(event.target.value)}
           />
         </div>
-        <Select
-          label="状态"
-          value={enabled ? "on" : "off"}
-          onChange={(value) => setEnabled(value === "on")}
-          options={[
-            { value: "on", label: "启用" },
-            { value: "off", label: "停用" },
-          ]}
-        />
+        <div className="switch-row">
+          <span>启用此模型</span>
+          <Switch checked={enabled} label="启用此模型" onCheckedChange={setEnabled} />
+        </div>
         <Alert>{error}</Alert>
       </div>
       <div className="dialog-actions model-form-footer">
@@ -921,22 +1348,30 @@ function RulesSection({
 }) {
   const [globalRules, setGlobalRules] = useState(settings.global_rules_markdown);
   const [savingGlobal, setSavingGlobal] = useState(false);
+  const [savedGlobal, setSavedGlobal] = useState(false);
   const [globalError, setGlobalError] = useState("");
+
   const [bookId, setBookId] = useState(activeBook?.id ?? books[0]?.id ?? "");
   const currentBook = books.find((item) => item.id === bookId) ?? activeBook ?? books[0] ?? null;
   const [bookRules, setBookRules] = useState(currentBook?.rules_markdown ?? "");
   const [savingBook, setSavingBook] = useState(false);
+  const [savedBook, setSavedBook] = useState(false);
   const [bookError, setBookError] = useState("");
 
   useEffect(() => {
     if (!currentBook) return;
     setBookRules(currentBook.rules_markdown);
+    setSavedBook(false);
   }, [currentBook]);
+
+  const globalDirty = globalRules !== settings.global_rules_markdown;
+  const bookDirty = Boolean(currentBook && bookRules !== currentBook.rules_markdown);
 
   async function saveGlobalRules(event: FormEvent) {
     event.preventDefault();
     setSavingGlobal(true);
     setGlobalError("");
+    setSavedGlobal(false);
     try {
       const result = await request("/settings", settingsSchema, {
         method: "PATCH",
@@ -946,6 +1381,7 @@ function RulesSection({
           global_rules_markdown: globalRules,
         },
       });
+      setSavedGlobal(true);
       onSettingsSaved(result);
     } catch (failure) {
       setGlobalError(errorText(failure));
@@ -959,11 +1395,13 @@ function RulesSection({
     if (!currentBook) return;
     setSavingBook(true);
     setBookError("");
+    setSavedBook(false);
     try {
       await request(`/books/${currentBook.id}`, bookSchema, {
         method: "PATCH",
         body: { rules_markdown: bookRules },
       });
+      setSavedBook(true);
       onBookSaved();
     } catch (failure) {
       setBookError(errorText(failure));
@@ -973,63 +1411,77 @@ function RulesSection({
   }
 
   return (
-    <div className="stack">
-      <form className="settings-card" onSubmit={(event) => void saveGlobalRules(event)}>
-        <div className="settings-card-header">
-          <div className="settings-card-title">
+    <div className="settings-sections">
+      <form className="settings-block" onSubmit={(event) => void saveGlobalRules(event)}>
+        <div className="settings-section-bar">
+          <div>
             <h3>全局写作规则</h3>
-            <span className="settings-card-subtitle">
-              对所有作品生效，拼接在模式系统提示词之后（Markdown）
-            </span>
+            <p className="muted">对所有作品生效，用于约定个人文风偏好、忌用表达或通用叙事习惯。</p>
           </div>
-          <Button type="submit" variant="primary" disabled={savingGlobal}>
-            {savingGlobal ? "保存中…" : "保存全局规则"}
-          </Button>
+          <div className="row">
+            {savedGlobal && !globalDirty && <Badge tone="success">已保存</Badge>}
+            <Button type="submit" variant="primary" disabled={savingGlobal || !globalDirty}>
+              {savingGlobal ? "保存中…" : "保存"}
+            </Button>
+          </div>
         </div>
         <Textarea
-          label="全局规则内容"
-          rows={8}
+          aria-label="全局写作规则"
+          rows={6}
           value={globalRules}
-          onChange={(event) => setGlobalRules(event.target.value)}
+          onChange={(event) => {
+            setGlobalRules(event.target.value);
+            setSavedGlobal(false);
+          }}
           placeholder="记录个人文风偏好、忌用表达或通用叙事约束…"
         />
         <Alert>{globalError}</Alert>
       </form>
-      <form className="settings-card" onSubmit={(event) => void saveBookRules(event)}>
-        <div className="settings-card-header">
-          <div className="settings-card-title">
+
+      <hr className="settings-divider" />
+
+      <form className="settings-block" onSubmit={(event) => void saveBookRules(event)}>
+        <div className="settings-section-bar">
+          <div>
             <h3>单书写作规则</h3>
-            <span className="settings-card-subtitle">
-              仅对所选作品生效，拼接在全局规则与作品信息之后（Markdown）
-            </span>
+            <p className="muted">仅对选中的作品生效，用于补充人称视角、时代口吻或本书特殊禁忌。</p>
           </div>
           <div className="row">
             {books.length > 0 && currentBook && (
-              <div className="rules-book-select">
+              <div className="settings-book-picker">
                 <Select
+                  label="目标作品"
                   compact
-                  label="选择作品"
                   value={currentBook.id}
                   onChange={(value) => {
                     setBookId(value);
                     const picked = books.find((item) => item.id === value);
                     if (picked) setBookRules(picked.rules_markdown);
+                    setSavedBook(false);
                   }}
                   options={books.map((item) => ({ value: item.id, label: item.title }))}
                 />
               </div>
             )}
-            <Button type="submit" variant="primary" disabled={savingBook || !currentBook}>
-              {savingBook ? "保存中…" : "保存单书规则"}
+            {savedBook && !bookDirty && <Badge tone="success">已保存</Badge>}
+            <Button
+              type="submit"
+              variant="primary"
+              disabled={savingBook || !currentBook || !bookDirty}
+            >
+              {savingBook ? "保存中…" : "保存"}
             </Button>
           </div>
         </div>
         {currentBook ? (
           <Textarea
-            label="单书规则内容"
-            rows={8}
+            aria-label="单书写作规则"
+            rows={6}
             value={bookRules}
-            onChange={(event) => setBookRules(event.target.value)}
+            onChange={(event) => {
+              setBookRules(event.target.value);
+              setSavedBook(false);
+            }}
             placeholder="记录本书专属的人称视角、时代口吻或特殊禁忌…"
           />
         ) : (
@@ -1044,23 +1496,32 @@ function RulesSection({
 function PromptEditor({ initial, onSaved }: { initial: Prompt[]; onSaved: () => void }) {
   const [mode, setMode] = useState<"discuss" | "write" | "review">("discuss");
   const [prompts, setPrompts] = useState(initial);
+  const [savedSnapshot, setSavedSnapshot] = useState<Record<string, string>>(() =>
+    Object.fromEntries(initial.map((item) => [item.mode, item.markdown])),
+  );
   const [busy, setBusy] = useState(false);
+  const [savedNotice, setSavedNotice] = useState(false);
   const [error, setError] = useState("");
   const [reset, setReset] = useState(false);
+
   const current = prompts.find((item) => item.mode === mode);
   const activeMeta = modeMeta.find((item) => item.value === mode) ?? modeMeta[0];
+  const isDirty = Boolean(current && current.markdown !== (savedSnapshot[mode] ?? ""));
 
   async function save(restore: boolean) {
     if (!current) return;
     setBusy(true);
     setError("");
+    setSavedNotice(false);
     try {
       const saved = await request(`/settings/prompts/${current.mode}`, promptSchema, {
         method: restore ? "DELETE" : "PUT",
         ...(restore ? {} : { body: { markdown: current.markdown } }),
       });
       setPrompts((items) => items.map((item) => (item.mode === saved.mode ? saved : item)));
+      setSavedSnapshot((prev) => ({ ...prev, [saved.mode]: saved.markdown }));
       setReset(false);
+      setSavedNotice(true);
       onSaved();
     } catch (failure) {
       setError(errorText(failure));
@@ -1071,69 +1532,73 @@ function PromptEditor({ initial, onSaved }: { initial: Prompt[]; onSaved: () => 
 
   return (
     <form
-      className="prompts-master-detail"
+      className="settings-block prompts-editor-full"
       onSubmit={(event) => {
         event.preventDefault();
         void save(false);
       }}
     >
-      <div className="prompts-mode-list" aria-label="写作模式">
-        {modeMeta.map((item) => {
-          const Icon = item.icon;
-          return (
-            <Button
-              key={item.value}
-              variant="ghost"
-              aria-current={mode === item.value ? "true" : undefined}
-              onClick={() => {
-                setMode(item.value);
-                setError("");
-              }}
-            >
-              <Icon size={15} />
-              {item.label}模式
-            </Button>
-          );
-        })}
-      </div>
-      <div className="prompts-editor-pane">
-        <div className="settings-card-header">
-          <div className="settings-card-title">
-            <h3>{activeMeta.label}模式提示词</h3>
-            <span className="tool-scope-hint">{activeMeta.toolsHint}</span>
-          </div>
-          <div className="row">
-            <Button disabled={busy || !current} onClick={() => setReset(true)}>
-              <RotateCcw size={14} />
-              恢复默认
-            </Button>
-            <Button type="submit" variant="primary" disabled={busy || !current}>
-              {busy ? "保存中…" : "保存提示词"}
-            </Button>
-          </div>
+      <div className="settings-section-bar">
+        <div className="segmented-tabs" role="tablist" aria-label="选择写作模式">
+          {modeMeta.map((item) => {
+            const Icon = item.icon;
+            return (
+              <button
+                key={item.value}
+                type="button"
+                role="tab"
+                aria-selected={mode === item.value}
+                className={`segmented-tab ${mode === item.value ? "is-active" : ""}`}
+                onClick={() => {
+                  setMode(item.value);
+                  setError("");
+                  setSavedNotice(false);
+                }}
+              >
+                <Icon size={14} />
+                <span>{item.label}</span>
+              </button>
+            );
+          })}
         </div>
-        {current && (
-          <Textarea
-            label="系统提示词"
-            value={current.markdown}
-            onChange={(event) =>
-              setPrompts((items) =>
-                items.map((item) =>
-                  item.mode === mode ? { ...item, markdown: event.target.value } : item,
-                ),
-              )
-            }
-          />
-        )}
-        <Alert>{error}</Alert>
+        <div className="row">
+          {savedNotice && !isDirty && <Badge tone="success">已保存</Badge>}
+          <Button disabled={busy || !current} onClick={() => setReset(true)}>
+            <RotateCcw size={14} />
+            恢复默认
+          </Button>
+          <Button type="submit" variant="primary" disabled={busy || !current || !isDirty}>
+            {busy ? "保存中…" : "保存"}
+          </Button>
+        </div>
       </div>
+
+      <p className="muted">{activeMeta.toolsHint}</p>
+
+      {current && (
+        <Textarea
+          aria-label={`${activeMeta.label}提示词`}
+          className="prompts-textarea"
+          value={current.markdown}
+          onChange={(event) => {
+            setPrompts((items) =>
+              items.map((item) =>
+                item.mode === mode ? { ...item, markdown: event.target.value } : item,
+              ),
+            );
+            setSavedNotice(false);
+          }}
+        />
+      )}
+      <Alert>{error}</Alert>
+
       <Dialog
         open={reset}
         onOpenChange={(value) => {
           if (!busy) setReset(value);
         }}
         title="恢复默认提示词"
-        description="将替换当前模式的自定义提示词，并立即保存。"
+        description={`确定将「${activeMeta.label}」恢复为默认提示词吗？`}
       >
         <Alert>{error}</Alert>
         <div className="dialog-actions">
@@ -1146,5 +1611,439 @@ function PromptEditor({ initial, onSaved }: { initial: Prompt[]; onSaved: () => 
         </div>
       </Dialog>
     </form>
+  );
+}
+
+function EditorPrefsSection() {
+  const [prefs, setPrefs] = useState<EditorPrefs>(() => loadEditorPrefs());
+
+  function update(patch: Partial<EditorPrefs>) {
+    const next = { ...prefs, ...patch };
+    setPrefs(next);
+    saveEditorPrefs(next);
+  }
+
+  return (
+    <div className="settings-sections">
+      <div className="settings-section-bar">
+        <div>
+          <h3>排版与阅读偏好</h3>
+          <p className="muted">即时应用于当前设备上的正文与设定编辑器，无需额外保存。</p>
+        </div>
+        <Button
+          variant="ghost"
+          onClick={() => {
+            setPrefs(DEFAULT_EDITOR_PREFS);
+            saveEditorPrefs(DEFAULT_EDITOR_PREFS);
+          }}
+        >
+          <RotateCcw size={14} />
+          恢复默认
+        </Button>
+      </div>
+
+      <div className="pref-row">
+        <div>
+          <strong>正文字体</strong>
+          <p className="muted">长篇写作推荐衬线体，梳理设定可选无衬线体。</p>
+        </div>
+        <div className="segmented-tabs">
+          <button
+            type="button"
+            className={`segmented-tab ${prefs.fontFamily === "serif" ? "is-active" : ""}`}
+            onClick={() => update({ fontFamily: "serif" })}
+          >
+            衬线体
+          </button>
+          <button
+            type="button"
+            className={`segmented-tab ${prefs.fontFamily === "sans" ? "is-active" : ""}`}
+            onClick={() => update({ fontFamily: "sans" })}
+          >
+            无衬线体
+          </button>
+        </div>
+      </div>
+
+      <div className="pref-row">
+        <div>
+          <strong>正文字号</strong>
+          <p className="muted">当前 {prefs.fontSize} px</p>
+        </div>
+        <div className="segmented-tabs">
+          {[14, 15, 16, 18, 20].map((size) => (
+            <button
+              key={size}
+              type="button"
+              className={`segmented-tab ${prefs.fontSize === size ? "is-active" : ""}`}
+              onClick={() => update({ fontSize: size })}
+            >
+              {size}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="pref-row">
+        <div>
+          <strong>正文行高</strong>
+          <p className="muted">调整段落呼吸感（当前 {prefs.lineHeight}）</p>
+        </div>
+        <div className="segmented-tabs">
+          {[
+            { value: 1.75, label: "紧凑" },
+            { value: 2.1, label: "适中" },
+            { value: 2.4, label: "宽松" },
+          ].map((option) => (
+            <button
+              key={option.value}
+              type="button"
+              className={`segmented-tab ${prefs.lineHeight === option.value ? "is-active" : ""}`}
+              onClick={() => update({ lineHeight: option.value })}
+            >
+              {option.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="pref-row">
+        <div>
+          <strong>正文栏宽</strong>
+          <p className="muted">控制单行阅读宽度。</p>
+        </div>
+        <div className="segmented-tabs">
+          {[
+            { value: "narrow" as const, label: "窄栏" },
+            { value: "medium" as const, label: "标准" },
+            { value: "wide" as const, label: "宽栏" },
+          ].map((option) => (
+            <button
+              key={option.value}
+              type="button"
+              className={`segmented-tab ${prefs.maxWidth === option.value ? "is-active" : ""}`}
+              onClick={() => update({ maxWidth: option.value })}
+            >
+              {option.label}
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${bytes} B`;
+}
+
+function DataServicePanel({
+  activeBook,
+  books,
+  onBookImported,
+}: {
+  activeBook: Book | null;
+  books: Book[];
+  onBookImported: () => void;
+}) {
+  const [status, setStatus] = useState<SystemStatus | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const [copiedPath, setCopiedPath] = useState(false);
+  const [exportBookId, setExportBookId] = useState(activeBook?.id ?? books[0]?.id ?? "");
+  const [deletingBackup, setDeletingBackup] = useState<BackupRecord | null>(null);
+  const importRef = useRef<HTMLInputElement | null>(null);
+
+  const selectedExportBook =
+    books.find((item) => item.id === exportBookId) ?? activeBook ?? books[0] ?? null;
+
+  async function reload() {
+    setLoading(true);
+    setError("");
+    try {
+      setStatus(await request("/system/status", systemStatusSchema));
+    } catch (failure) {
+      setError(errorText(failure));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void reload();
+  }, []);
+
+  async function createBackup() {
+    setBusy(true);
+    setError("");
+    setMessage("");
+    try {
+      const record = await request("/backups", backupRecordSchema, { method: "POST" });
+      setMessage(`已备份：${record.name}`);
+      await reload();
+    } catch (failure) {
+      setError(errorText(failure));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function confirmDeleteBackup() {
+    if (!deletingBackup) return;
+    setBusy(true);
+    setError("");
+    try {
+      await remove(`/backups/${encodeURIComponent(deletingBackup.name)}`);
+      setDeletingBackup(null);
+      await reload();
+    } catch (failure) {
+      setError(errorText(failure));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function importZip(file: File | undefined) {
+    if (!file) return;
+    setBusy(true);
+    setError("");
+    setMessage("");
+    try {
+      const imported = await upload("/books/import", bookSchema, file, "POST", "application/zip");
+      setMessage(`已导入作品「${imported.title}」`);
+      setExportBookId(imported.id);
+      onBookImported();
+      await reload();
+    } catch (failure) {
+      setError(errorText(failure));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function downloadBook(bookId: string, format: "zip" | "md" | "txt") {
+    const link = document.createElement("a");
+    link.href = `/api/books/${bookId}/export?format=${format}`;
+    link.download = "";
+    link.click();
+  }
+
+  function downloadBackup(name: string) {
+    const link = document.createElement("a");
+    link.href = `/api/backups/${encodeURIComponent(name)}`;
+    link.download = name;
+    link.click();
+  }
+
+  async function copyDataDir(dir: string) {
+    try {
+      await navigator.clipboard.writeText(dir);
+      setCopiedPath(true);
+      window.setTimeout(() => setCopiedPath(false), 1800);
+    } catch {
+      /* Clipboard unavailable. */
+    }
+  }
+
+  return (
+    <div className="settings-sections">
+      <Alert>{error}</Alert>
+      {message && (
+        <div className="badge badge-success" role="status">
+          {message}
+        </div>
+      )}
+
+      <section className="settings-block">
+        <div className="settings-section-bar">
+          <div>
+            <h3>作品导入与导出</h3>
+            <p className="muted">选择任意作品导出完整 ZIP 包或正文合集，也可导入外部作品包。</p>
+          </div>
+          <div>
+            <input
+              ref={importRef}
+              type="file"
+              accept=".zip,application/zip"
+              hidden
+              onChange={(event) => {
+                void importZip(event.target.files?.[0]);
+                event.target.value = "";
+              }}
+            />
+            <Button disabled={busy} onClick={() => importRef.current?.click()}>
+              <Upload size={14} />
+              导入 ZIP 作品
+            </Button>
+          </div>
+        </div>
+        {books.length > 0 && selectedExportBook ? (
+          <div className="data-export-bar">
+            <div className="settings-book-picker">
+              <Select
+                label="选择导出作品"
+                compact
+                value={selectedExportBook.id}
+                onChange={setExportBookId}
+                options={books.map((item) => ({ value: item.id, label: item.title }))}
+              />
+            </div>
+            <div className="row">
+              <Button onClick={() => downloadBook(selectedExportBook.id, "zip")}>
+                <Download size={14} />
+                ZIP 完整包
+              </Button>
+              <Button onClick={() => downloadBook(selectedExportBook.id, "md")}>
+                <Download size={14} />
+                Markdown
+              </Button>
+              <Button onClick={() => downloadBook(selectedExportBook.id, "txt")}>
+                <Download size={14} />
+                TXT
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <p className="muted">暂无可导出的作品。</p>
+        )}
+      </section>
+
+      <hr className="settings-divider" />
+
+      <section className="settings-block">
+        <div className="settings-section-bar">
+          <div>
+            <h3>本地完整备份</h3>
+            <p className="muted">将全部作品数据、对话与封面附件打包为独立 ZIP 备份文件。</p>
+          </div>
+          <Button variant="primary" disabled={busy} onClick={() => void createBackup()}>
+            <HardDrive size={14} />
+            {busy ? "备份中…" : "立即备份"}
+          </Button>
+        </div>
+        {status && status.backups.length > 0 ? (
+          <div className="flat-list">
+            {status.backups.map((item) => (
+              <div className="flat-list-row" key={item.name}>
+                <div className="flat-list-main">
+                  <div className="row">
+                    <strong>{item.name}</strong>
+                    <Badge>{item.includes_attachments ? "完整备份" : "旧版数据库"}</Badge>
+                  </div>
+                  <span className="muted">
+                    {formatBytes(item.size_bytes)} ·{" "}
+                    {new Date(item.created_at).toLocaleString("zh-CN")}
+                  </span>
+                </div>
+                <div className="row">
+                  <Button
+                    variant="ghost"
+                    className="icon-control"
+                    title="下载备份"
+                    aria-label={`下载备份 ${item.name}`}
+                    onClick={() => downloadBackup(item.name)}
+                  >
+                    <Download size={14} />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    className="icon-control"
+                    title="删除备份"
+                    aria-label={`删除备份 ${item.name}`}
+                    disabled={busy}
+                    onClick={() => setDeletingBackup(item)}
+                  >
+                    <Trash2 size={14} />
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="muted">暂无备份文件</p>
+        )}
+      </section>
+
+      <hr className="settings-divider" />
+
+      <section className="settings-block">
+        <div className="settings-section-bar">
+          <div>
+            <h3>本机服务与存储</h3>
+            <p className="muted">当前服务运行状态及数据文件存放位置。</p>
+          </div>
+          <Button disabled={loading || busy} onClick={() => void reload()}>
+            <RefreshCw size={14} />
+            刷新
+          </Button>
+        </div>
+        {loading ? (
+          <p className="muted">正在读取状态…</p>
+        ) : (
+          status && (
+            <div className="data-status-grid">
+              <div>
+                <span className="muted">服务地址</span>
+                <strong>
+                  http://{status.host}:{status.port}
+                </strong>
+              </div>
+              <div>
+                <span className="muted">内容规模</span>
+                <strong>
+                  {status.books} 部作品 · {status.sessions} 段对话
+                </strong>
+              </div>
+              <div>
+                <span className="muted">数据占用</span>
+                <strong>
+                  {formatBytes(status.database_bytes + status.wal_bytes + status.attachments_bytes)}
+                </strong>
+              </div>
+              <div>
+                <span className="muted">数据结构版本</span>
+                <strong>v{status.schema_version}</strong>
+              </div>
+              <div className="data-status-wide">
+                <div className="row spread">
+                  <span className="muted">数据目录</span>
+                  <button
+                    type="button"
+                    className="copy-path-btn"
+                    onClick={() => void copyDataDir(status.data_dir)}
+                  >
+                    {copiedPath ? <Check size={12} /> : <Copy size={12} />}
+                    <span>{copiedPath ? "已复制" : "复制路径"}</span>
+                  </button>
+                </div>
+                <code>{status.data_dir}</code>
+              </div>
+            </div>
+          )
+        )}
+      </section>
+
+      <Dialog
+        open={deletingBackup !== null}
+        onOpenChange={(value) => {
+          if (!value && !busy) setDeletingBackup(null);
+        }}
+        title="删除备份"
+        description={`确定删除备份文件「${deletingBackup?.name ?? ""}」吗？此操作无法撤销。`}
+      >
+        <div className="dialog-actions">
+          <Button disabled={busy} onClick={() => setDeletingBackup(null)}>
+            取消
+          </Button>
+          <Button variant="danger" disabled={busy} onClick={() => void confirmDeleteBackup()}>
+            确认删除
+          </Button>
+        </div>
+      </Dialog>
+    </div>
   );
 }
