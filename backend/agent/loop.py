@@ -33,6 +33,7 @@ from backend.agent.tools import (
     ToolFailure,
     tools_for_mode,
 )
+from backend.errors import ErrorInfo, exception_error, safe_error
 from backend.llm.client import LLMClient
 from backend.llm.errors import LLMError
 from backend.llm.types import (
@@ -225,7 +226,8 @@ class AgentRunner:
                     else float(2**attempt)
                 )
                 delay = min(max(delay, 0.1), 30.0)
-                await emit_event(sink, AttemptResetEvent(run_id, attempt + 1, exc.message))
+                error = exception_error(exc)
+                await emit_event(sink, AttemptResetEvent(run_id, attempt + 1, error.message, error))
                 await self._sleep_cancellable(delay, cancel_event)
         raise RuntimeError("Unreachable retry exhaustion")
 
@@ -337,6 +339,40 @@ class AgentRunner:
             final_results.append(res)
         return final_results
 
+    async def _execute_and_record_tools(
+        self,
+        tool_calls: list[ToolCallBlock],
+        *,
+        tool_map: dict[str, BoundTool],
+        tool_ctx: ToolContext,
+        sink: EventSink | None,
+    ) -> list[ToolExecutionResult]:
+        results = await self._execute_tools(
+            tool_calls,
+            tool_map=tool_map,
+            tool_ctx=tool_ctx,
+            sink=sink,
+        )
+        blocks = tuple(
+            ToolResultBlock(
+                call_id=call.call_id,
+                name=call.name,
+                content=result.content,
+                is_error=result.is_error,
+            )
+            for call, result in zip(tool_calls, results, strict=True)
+        )
+        with self.db.transaction() as conn:
+            append_message(
+                conn,
+                session_id=tool_ctx.session_id,
+                book_id=tool_ctx.book_id,
+                run_id=tool_ctx.run_id,
+                role=MessageRole.TOOL,
+                blocks_json=serialize_blocks(blocks),
+            )
+        return results
+
     def _finish_db_run(
         self,
         run_id: str,
@@ -344,6 +380,7 @@ class AgentRunner:
         status: RunStatus,
         usage: TokenUsage,
         error_message: str | None = None,
+        error: ErrorInfo | None = None,
     ) -> Run:
         with self.db.transaction() as conn:
             return finish_run(
@@ -351,6 +388,7 @@ class AgentRunner:
                 run_id,
                 status=status,
                 error_message=error_message,
+                error=error,
                 input_tokens=usage.input_tokens,
                 output_tokens=usage.output_tokens,
                 cache_read_tokens=usage.cache_read_tokens,
@@ -382,6 +420,7 @@ class AgentRunner:
         sink: EventSink | None = None,
         cancel_event: asyncio.Event | None = None,
         steer_queue: asyncio.Queue[str] | None = None,
+        run_id: str | None = None,
     ) -> Run:
         """Run one complete user-initiated agent loop until stop, suspend, cancel, or error."""
         session, book = self._load_session_and_book(session_id)
@@ -395,12 +434,19 @@ class AgentRunner:
                     role=MessageRole.USER,
                     blocks_json=serialize_blocks((TextBlock(user_text),)),
                 )
-            run = create_run(
-                conn,
-                session_id=session.id,
-                book_id=book.id,
-                model_id=model_id,
-            )
+            prepared = get_run(conn, run_id) if run_id is not None else None
+            if prepared is not None:
+                if prepared.session_id != session.id or prepared.status != RunStatus.RUNNING:
+                    raise ValueError("Prepared run does not belong to this active session")
+                run = prepared
+            else:
+                run = create_run(
+                    conn,
+                    session_id=session.id,
+                    book_id=book.id,
+                    model_id=model_id,
+                    run_id=run_id,
+                )
 
         await emit_event(sink, RunStartedEvent(run.id, session.id, book.id))
 
@@ -501,30 +547,21 @@ class AgentRunner:
                     )
                     return done_run
 
-                tool_results = await self._execute_tools(
-                    tool_calls,
-                    tool_map=tool_map,
-                    tool_ctx=tool_ctx,
-                    sink=sink,
-                )
-                result_blocks = tuple(
-                    ToolResultBlock(
-                        call_id=tc.call_id,
-                        name=tc.name,
-                        content=res.content,
-                        is_error=res.is_error,
+                tool_task = asyncio.create_task(
+                    self._execute_and_record_tools(
+                        tool_calls,
+                        tool_map=tool_map,
+                        tool_ctx=tool_ctx,
+                        sink=sink,
                     )
-                    for tc, res in zip(tool_calls, tool_results, strict=True)
                 )
-                with self.db.transaction() as conn:
-                    append_message(
-                        conn,
-                        session_id=session.id,
-                        book_id=book.id,
-                        run_id=run.id,
-                        role=MessageRole.TOOL,
-                        blocks_json=serialize_blocks(result_blocks),
-                    )
+                try:
+                    tool_results = await asyncio.shield(tool_task)
+                except asyncio.CancelledError:
+                    # SQLite worker threads cannot be interrupted. Finish their bounded
+                    # transactions and paired tool results before unlocking the session.
+                    await tool_task
+                    raise
 
                 suspended = next(
                     (
@@ -549,13 +586,15 @@ class AgentRunner:
                     await emit_event(sink, WaitingUserEvent(run.id, question, options))
                     return waiting_run
 
-            err_msg = f"Agent loop reached max_iterations ({self.max_iterations})"
+            error = safe_error("iteration_limit")
+            err_msg = error.message
             usage_now = total_usage()
             failed_run = self._finish_db_run(
                 run.id,
                 status=RunStatus.FAILED,
                 usage=usage_now,
                 error_message=err_msg,
+                error=error,
             )
             await emit_event(
                 sink,
@@ -563,6 +602,7 @@ class AgentRunner:
                     run.id,
                     RunStatus.FAILED,
                     error_message=err_msg,
+                    error=error,
                     usage=usage_now,
                 ),
             )
@@ -587,13 +627,15 @@ class AgentRunner:
             )
             raise
         except Exception as exc:
-            err_msg = str(exc) or type(exc).__name__
+            error = exception_error(exc)
+            err_msg = error.message
             usage_now = total_usage()
             failed_run = self._finish_db_run(
                 run.id,
                 status=RunStatus.FAILED,
                 usage=usage_now,
                 error_message=err_msg,
+                error=error,
             )
             await emit_event(
                 sink,
@@ -601,6 +643,7 @@ class AgentRunner:
                     run.id,
                     RunStatus.FAILED,
                     error_message=err_msg,
+                    error=error,
                     usage=usage_now,
                 ),
             )

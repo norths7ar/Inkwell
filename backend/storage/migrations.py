@@ -6,7 +6,7 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _V1_STATEMENTS: tuple[str, ...] = (
     """
@@ -211,7 +211,10 @@ _V1_STATEMENTS: tuple[str, ...] = (
     "CREATE INDEX idx_runs_session_started ON runs (session_id, started_at)",
 )
 
-MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = ((1, _V1_STATEMENTS),)
+MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
+    (1, _V1_STATEMENTS),
+    (2, ("ALTER TABLE runs ADD COLUMN error_json TEXT",)),
+)
 
 
 @contextmanager

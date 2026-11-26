@@ -6,6 +6,7 @@ import inspect
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
+from backend.errors import ErrorInfo
 from backend.llm.types import TokenUsage
 from backend.storage.models import PendingChange, RunStatus
 
@@ -34,6 +35,7 @@ class AttemptResetEvent:
     run_id: str
     attempt: int
     reason: str
+    error: ErrorInfo | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +74,7 @@ class RunFinishedEvent:
     status: RunStatus
     error_message: str | None = None
     usage: TokenUsage = TokenUsage()
+    error: ErrorInfo | None = None
 
 
 type AgentEvent = (

@@ -7,6 +7,8 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from backend.errors import ErrorInfo
+
 
 class EntryKind(StrEnum):
     CHARACTER = "character"
@@ -220,6 +222,7 @@ class Run:
     cache_write_tokens: int
     started_at: str
     finished_at: str | None
+    error: ErrorInfo | None = None
 
 
 @dataclass(frozen=True, slots=True)

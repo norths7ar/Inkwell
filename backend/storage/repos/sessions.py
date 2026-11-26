@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import sqlite3
 
+from pydantic import TypeAdapter
+
+from backend.errors import ErrorInfo
 from backend.storage.ids import new_id, utc_now
 from backend.storage.migrations import ensure_transaction
 from backend.storage.models import (
@@ -49,6 +52,11 @@ def _run_from_row(row: sqlite3.Row) -> Run:
         cache_write_tokens=int(row["cache_write_tokens"]),
         started_at=str(row["started_at"]),
         finished_at=str(raw_finished_at) if raw_finished_at is not None else None,
+        error=(
+            TypeAdapter(ErrorInfo).validate_json(str(row["error_json"]))
+            if row["error_json"] is not None
+            else None
+        ),
     )
 
 
@@ -215,6 +223,7 @@ def finish_run(
     *,
     status: RunStatus,
     error_message: str | None = None,
+    error: ErrorInfo | None = None,
     input_tokens: int = 0,
     output_tokens: int = 0,
     cache_read_tokens: int = 0,
@@ -229,17 +238,18 @@ def finish_run(
             SET status = ?, pending_question_json = NULL, error_message = ?,
                 input_tokens = ?, output_tokens = ?,
                 cache_read_tokens = ?, cache_write_tokens = ?,
-                finished_at = ?
+                finished_at = ?, error_json = ?
             WHERE id = ?
             """,
             (
                 status.value,
-                error_message,
+                error.message if error is not None else error_message,
                 input_tokens,
                 output_tokens,
                 cache_read_tokens,
                 cache_write_tokens,
                 utc_now(),
+                TypeAdapter(ErrorInfo).dump_json(error).decode() if error is not None else None,
                 run_id,
             ),
         )

@@ -63,8 +63,8 @@ def default_data_dir() -> Path:
 
 def _parse_port(raw_port: int | str) -> int:
     port = int(raw_port)
-    if not 1 <= port <= 65535:
-        raise ValueError(f"Port must be between 1 and 65535, got {port}")
+    if not 0 <= port <= 65535:
+        raise ValueError(f"Port must be between 0 and 65535, got {port}")
     return port
 
 
