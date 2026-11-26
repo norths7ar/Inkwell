@@ -84,6 +84,16 @@ def create_router(runtime: ApiRuntime) -> APIRouter:
 
     @router.patch("/sessions/{session_id}")
     async def update_session(session_id: str, body: SessionInput) -> Session:
+        existing = require_session(session_id)
+        if (
+            "visibility_scope" in body.model_fields_set
+            and existing.visibility_scope == Visibility.GLOBAL
+            and body.visibility_scope == Visibility.LOCAL
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Session visibility scope cannot be downgraded from global to local",
+            )
         runtime.ensure_session_idle(session_id)
         session = sessions.update_session(
             runtime.conn,

@@ -83,7 +83,7 @@ async def workspace(
             load_config(data_dir=data_dir or directory),
             llm=llm,
             events=events,
-            static_dir=static_dir,
+            static_dir=static_dir if static_dir is not None else Path(directory) / "no-frontend",
         )
         async with (
             app.router.lifespan_context(app),
