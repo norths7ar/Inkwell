@@ -6,7 +6,7 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _V1_STATEMENTS: tuple[str, ...] = (
     """
@@ -233,6 +233,75 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             created_at TEXT NOT NULL
         )""",
             "CREATE INDEX idx_compactions_session_seq ON compactions(session_id, through_seq)",
+        ),
+    ),
+    (
+        5,
+        (
+            "ALTER TABLE chapters ADD COLUMN deleted_at TEXT",
+            """
+            CREATE TABLE entries_v5 (
+                id TEXT PRIMARY KEY,
+                book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL CHECK (kind IN ('character', 'world', 'outline', 'note')),
+                title TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT '',
+                content TEXT NOT NULL DEFAULT '',
+                visibility TEXT NOT NULL DEFAULT 'local'
+                    CHECK (visibility IN ('local', 'global')),
+                meta_json TEXT NOT NULL DEFAULT '{}',
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                deleted_at TEXT
+            )
+            """,
+            """
+            INSERT INTO entries_v5 (
+                id, book_id, kind, title, category, content, visibility,
+                meta_json, sort_order, created_at, updated_at
+            )
+            SELECT
+                id, book_id, kind, title, category, content, visibility,
+                meta_json, sort_order, created_at, updated_at
+            FROM entries
+            """,
+            "DROP TABLE entries",
+            "ALTER TABLE entries_v5 RENAME TO entries",
+            "CREATE INDEX idx_entries_book_order ON entries (book_id, kind, sort_order)",
+            "CREATE INDEX idx_chapters_deleted ON chapters (book_id, deleted_at)",
+            "CREATE INDEX idx_entries_deleted ON entries (book_id, deleted_at)",
+            """
+            CREATE TABLE entry_folders (
+                id TEXT PRIMARY KEY,
+                book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL CHECK (kind IN ('character', 'world', 'outline', 'note')),
+                title TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (book_id, kind, title)
+            )
+            """,
+            "CREATE INDEX idx_entry_folders_book_kind ON entry_folders (book_id, kind, sort_order)",
+            """
+            INSERT OR IGNORE INTO entry_folders (
+                id, book_id, kind, title, description, sort_order, created_at, updated_at
+            )
+            SELECT
+                lower(hex(randomblob(16))),
+                book_id,
+                kind,
+                trim(category),
+                '',
+                0,
+                min(created_at),
+                max(updated_at)
+            FROM entries
+            WHERE trim(category) != ''
+            GROUP BY book_id, kind, trim(category)
+            """,
         ),
     ),
 )

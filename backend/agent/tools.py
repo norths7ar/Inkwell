@@ -184,7 +184,7 @@ class _ReadSummariesArgs(BaseModel):
 class _ReadEntriesArgs(BaseModel):
     kind: EntryKind | None = Field(
         default=None,
-        description="可选条目类型：character（人物）、world（世界观）或 note（笔记）。",
+        description="可选条目类型：character（人物）、world（世界观）、outline（提纲）或 note（笔记）。",
     )
     entry_id: str | None = Field(default=None, description="可选条目 ID，用于读取单条完整内容。")
 
@@ -198,7 +198,7 @@ class _ProposeEntryEditArgs(BaseModel):
     action: PendingAction = Field(description="操作类型：create、update 或 delete。")
     target_id: str | None = Field(default=None, description="update 或 delete 时必填的条目 ID。")
     kind: EntryKind = Field(
-        default=EntryKind.NOTE, description="条目类型：character、world 或 note。"
+        default=EntryKind.NOTE, description="条目类型：character、world、outline 或 note。"
     )
     title: str = Field(default="", description="条目标题。")
     category: str = Field(default="", description="可选分组或标签。")

@@ -12,6 +12,7 @@ from urllib.parse import quote
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi.responses import FileResponse
 
 from backend import archive
 from backend.api.runtime import ApiRuntime
@@ -55,11 +56,29 @@ def _size(path: Path) -> int:
 
 def _backup_record(path: Path) -> BackupRecord:
     info = path.stat()
+    is_zip = path.suffix.lower() == ".zip"
     return BackupRecord(
         name=path.name,
         size_bytes=info.st_size,
         created_at=datetime.fromtimestamp(info.st_mtime, UTC).isoformat(),
+        kind="zip" if is_zip else "sqlite",
+        includes_attachments=is_zip,
+        includes_encryption_key=False,
     )
+
+
+def _safe_backup_path(backups_dir: Path, name: str) -> Path:
+    if (
+        not name
+        or Path(name).name != name
+        or not name.startswith("inkwell-")
+        or not (name.endswith(".zip") or name.endswith(".sqlite3"))
+    ):
+        raise HTTPException(404, "Backup not found")
+    target = backups_dir / name
+    if not target.is_file() or target.is_symlink():
+        raise HTTPException(404, "Backup not found")
+    return target
 
 
 def create_router(runtime: ApiRuntime) -> APIRouter:
@@ -68,7 +87,10 @@ def create_router(runtime: ApiRuntime) -> APIRouter:
     covers_dir = runtime.config.attachments_dir / "covers"
 
     def list_backups() -> list[BackupRecord]:
-        files = runtime.config.backups_dir.glob("inkwell-*.sqlite3")
+        files = [
+            *runtime.config.backups_dir.glob("inkwell-*.zip"),
+            *runtime.config.backups_dir.glob("inkwell-*.sqlite3"),
+        ]
         return sorted(
             [_backup_record(path) for path in files if path.is_file() and not path.is_symlink()],
             key=lambda item: (item.created_at, item.name),
@@ -123,21 +145,49 @@ def create_router(runtime: ApiRuntime) -> APIRouter:
         directory = runtime.config.backups_dir
         directory.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-        destination = directory / f"inkwell-{stamp}-{uuid4().hex[:8]}.sqlite3"
-        partial = destination.with_suffix(".partial")
+        token = uuid4().hex[:8]
+        destination = directory / f"inkwell-{stamp}-{token}.zip"
+        db_partial = directory / f"inkwell-{stamp}-{token}.sqlite3.partial"
+        zip_partial = directory / f"inkwell-{stamp}-{token}.zip.partial"
         try:
-            with closing(sqlite3.connect(partial)) as target:
+            with closing(sqlite3.connect(db_partial)) as target:
                 runtime.conn.backup(target)
                 if target.execute("PRAGMA quick_check").fetchone() != ("ok",):
-                    raise RuntimeError("Snapshot integrity check failed")
-            partial.replace(destination)
+                    raise RuntimeError("Backup integrity check failed")
+            with zipfile.ZipFile(zip_partial, "w", compression=zipfile.ZIP_DEFLATED) as pkg:
+                pkg.write(db_partial, "inkwell.sqlite3")
+                attachments_dir = runtime.config.attachments_dir
+                if attachments_dir.is_dir():
+                    for path in sorted(attachments_dir.rglob("*")):
+                        if path.is_file() and not path.is_symlink():
+                            rel = path.relative_to(attachments_dir).as_posix()
+                            pkg.write(path, f"attachments/{rel}")
+            zip_partial.replace(destination)
         finally:
-            partial.unlink(missing_ok=True)
+            db_partial.unlink(missing_ok=True)
+            zip_partial.unlink(missing_ok=True)
         result = _backup_record(destination)
         runtime.events.publish(
             "content_changed", {"book_id": None, "resource": "backup", "resource_id": result.name}
         )
         return result
+
+    @router.get("/backups/{name}")
+    async def download_backup(name: str) -> FileResponse:
+        target = _safe_backup_path(runtime.config.backups_dir, name)
+        media_type = (
+            "application/zip" if target.suffix.lower() == ".zip" else "application/octet-stream"
+        )
+        return FileResponse(target, media_type=media_type, filename=target.name)
+
+    @router.delete("/backups/{name}", status_code=204)
+    async def remove_backup(name: str) -> Response:
+        target = _safe_backup_path(runtime.config.backups_dir, name)
+        target.unlink()
+        runtime.events.publish(
+            "content_changed", {"book_id": None, "resource": "backup", "resource_id": name}
+        )
+        return Response(status_code=204)
 
     @router.get("/system/status")
     async def status() -> SystemStatus:

@@ -17,7 +17,12 @@ from backend.storage.repos import content
 MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
 MAX_EXPANDED_BYTES = 128 * 1024 * 1024
 MAX_MEMBERS = 10_000
-_KINDS = {EntryKind.CHARACTER: "人物", EntryKind.WORLD: "世界", EntryKind.NOTE: "笔记"}
+_KINDS = {
+    EntryKind.CHARACTER: "人物",
+    EntryKind.WORLD: "世界",
+    EntryKind.OUTLINE: "提纲",
+    EntryKind.NOTE: "笔记",
+}
 _COVER_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
 

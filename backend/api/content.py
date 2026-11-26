@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
@@ -15,6 +16,7 @@ from backend.storage.models import (
     Book,
     Chapter,
     Entry,
+    EntryFolder,
     EntryKind,
     PendingAction,
     PendingChange,
@@ -62,6 +64,23 @@ class EntryInput(Input):
     visibility: Visibility = Visibility.LOCAL
     meta_json: str = "{}"
     sort_order: int = 0
+
+
+class EntryFolderInput(Input):
+    kind: EntryKind = EntryKind.NOTE
+    title: str = Field(default="未命名文件夹", min_length=1)
+    description: str = ""
+    sort_order: int = 0
+
+
+class TrashRestoreInput(Input):
+    target_type: TargetType
+    target_id: str = Field(min_length=1)
+
+
+class TrashPayload(BaseModel):
+    chapters: list[Chapter]
+    entries: list[Entry]
 
 
 class BatchChangesInput(Input):
@@ -372,6 +391,108 @@ def create_router(runtime: ApiRuntime) -> APIRouter:
             revision(item)
             content.delete_entry(runtime.conn, entry_id)
         changed(item.book_id, "entry", item.id)
+        return Response(status_code=204)
+
+    @router.get("/books/{book_id}/folders")
+    async def entry_folders(book_id: str, kind: EntryKind | None = None) -> list[EntryFolder]:
+        required(content.get_book(runtime.conn, book_id))
+        return content.list_entry_folders(runtime.conn, book_id, kind=kind)
+
+    @router.post("/books/{book_id}/folders", status_code=201)
+    async def add_entry_folder(book_id: str, body: EntryFolderInput) -> EntryFolder:
+        required(content.get_book(runtime.conn, book_id))
+        if not body.title.strip():
+            raise HTTPException(422, "Folder title cannot be blank")
+        try:
+            item = content.create_entry_folder(
+                runtime.conn,
+                book_id=book_id,
+                kind=body.kind,
+                title=body.title,
+                description=body.description,
+                sort_order=body.sort_order,
+            )
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(409, "Folder with this name already exists") from exc
+        changed(book_id, "folder", item.id)
+        return item
+
+    @router.patch("/folders/{folder_id}")
+    async def edit_entry_folder(folder_id: str, body: EntryFolderInput) -> EntryFolder:
+        required(content.get_entry_folder(runtime.conn, folder_id))
+        if "title" in body.model_fields_set and not body.title.strip():
+            raise HTTPException(422, "Folder title cannot be blank")
+        try:
+            item = content.update_entry_folder(
+                runtime.conn,
+                folder_id,
+                title=supplied(body, "title", body.title),
+                description=supplied(body, "description", body.description),
+                sort_order=supplied(body, "sort_order", body.sort_order),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(409, "Folder with this name already exists") from exc
+        changed(item.book_id, "folder", item.id)
+        return item
+
+    @router.delete("/folders/{folder_id}", status_code=204)
+    async def remove_entry_folder(folder_id: str) -> Response:
+        existing = required(content.get_entry_folder(runtime.conn, folder_id))
+        content.delete_entry_folder(runtime.conn, folder_id)
+        changed(existing.book_id, "folder", folder_id)
+        return Response(status_code=204)
+
+    @router.get("/books/{book_id}/trash")
+    async def trash(book_id: str) -> TrashPayload:
+        required(content.get_book(runtime.conn, book_id))
+        return TrashPayload(
+            chapters=content.list_deleted_chapters(runtime.conn, book_id),
+            entries=content.list_deleted_entries(runtime.conn, book_id),
+        )
+
+    @router.post("/books/{book_id}/trash/restore")
+    async def restore_from_trash(book_id: str, body: TrashRestoreInput) -> Chapter | Entry:
+        required(content.get_book(runtime.conn, book_id))
+        if body.target_type == TargetType.CHAPTER:
+            existing = required(
+                content.get_chapter(runtime.conn, body.target_id, include_deleted=True)
+            )
+            if existing.book_id != book_id or existing.deleted_at is None:
+                raise HTTPException(404, "Deleted chapter not found")
+            restored: Chapter | Entry = content.restore_chapter(runtime.conn, body.target_id)
+        else:
+            existing_entry = required(
+                content.get_entry(runtime.conn, body.target_id, include_deleted=True)
+            )
+            if existing_entry.book_id != book_id or existing_entry.deleted_at is None:
+                raise HTTPException(404, "Deleted entry not found")
+            restored = content.restore_entry(runtime.conn, body.target_id)
+        changed(book_id, body.target_type.value, body.target_id)
+        return restored
+
+    @router.delete("/books/{book_id}/trash/{target_type}/{target_id}", status_code=204)
+    async def purge_trash_item(book_id: str, target_type: TargetType, target_id: str) -> Response:
+        required(content.get_book(runtime.conn, book_id))
+        if target_type == TargetType.CHAPTER:
+            existing = required(content.get_chapter(runtime.conn, target_id, include_deleted=True))
+            if existing.book_id != book_id or existing.deleted_at is None:
+                raise HTTPException(404, "Deleted chapter not found")
+            content.delete_chapter(runtime.conn, target_id, permanent=True)
+        else:
+            existing_entry = required(
+                content.get_entry(runtime.conn, target_id, include_deleted=True)
+            )
+            if existing_entry.book_id != book_id or existing_entry.deleted_at is None:
+                raise HTTPException(404, "Deleted entry not found")
+            content.delete_entry(runtime.conn, target_id, permanent=True)
+        changed(book_id, "trash", target_id)
+        return Response(status_code=204)
+
+    @router.delete("/books/{book_id}/trash", status_code=204)
+    async def purge_trash(book_id: str) -> Response:
+        required(content.get_book(runtime.conn, book_id))
+        content.empty_trash(runtime.conn, book_id)
+        changed(book_id, "trash", book_id)
         return Response(status_code=204)
 
     @router.get("/books/{book_id}/search")

@@ -11,6 +11,7 @@ from backend.storage.models import (
     Book,
     Chapter,
     Entry,
+    EntryFolder,
     EntryKind,
     SearchHit,
     TargetType,
@@ -66,6 +67,7 @@ def delete_book_fts(conn: sqlite3.Connection, *, book_id: str) -> None:
 
 
 def _book_from_row(row: sqlite3.Row) -> Book:
+    keys = set(row.keys())
     return Book(
         id=str(row["id"]),
         title=str(row["title"]),
@@ -75,6 +77,8 @@ def _book_from_row(row: sqlite3.Row) -> Book:
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
         cover_path=str(row["cover_path"]),
+        chapter_count=int(row["chapter_count"]) if "chapter_count" in keys else 0,
+        word_count=int(row["word_count"]) if "word_count" in keys else 0,
     )
 
 
@@ -91,7 +95,9 @@ def _volume_from_row(row: sqlite3.Row) -> Volume:
 
 
 def _chapter_from_row(row: sqlite3.Row) -> Chapter:
+    keys = set(row.keys())
     raw_volume_id = row["volume_id"]
+    raw_deleted_at = row["deleted_at"] if "deleted_at" in keys else None
     return Chapter(
         id=str(row["id"]),
         book_id=str(row["book_id"]),
@@ -103,10 +109,13 @@ def _chapter_from_row(row: sqlite3.Row) -> Chapter:
         sort_order=int(row["sort_order"]),
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
+        deleted_at=str(raw_deleted_at) if raw_deleted_at is not None else None,
     )
 
 
 def _entry_from_row(row: sqlite3.Row) -> Entry:
+    keys = set(row.keys())
+    raw_deleted_at = row["deleted_at"] if "deleted_at" in keys else None
     return Entry(
         id=str(row["id"]),
         book_id=str(row["book_id"]),
@@ -119,6 +128,37 @@ def _entry_from_row(row: sqlite3.Row) -> Entry:
         sort_order=int(row["sort_order"]),
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
+        deleted_at=str(raw_deleted_at) if raw_deleted_at is not None else None,
+    )
+
+
+def _entry_folder_from_row(row: sqlite3.Row) -> EntryFolder:
+    return EntryFolder(
+        id=str(row["id"]),
+        book_id=str(row["book_id"]),
+        kind=EntryKind(str(row["kind"])),
+        title=str(row["title"]),
+        description=str(row["description"]),
+        sort_order=int(row["sort_order"]),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def _ensure_entry_folder(
+    conn: sqlite3.Connection, *, book_id: str, kind: EntryKind, title: str, now: str
+) -> None:
+    clean = title.strip()
+    if not clean:
+        return
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO entry_folders (
+            id, book_id, kind, title, description, sort_order, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, '', 0, ?, ?)
+        """,
+        (new_id(), book_id, kind.value, clean, now, now),
     )
 
 
@@ -161,12 +201,35 @@ def create_book(
 
 
 def get_book(conn: sqlite3.Connection, book_id: str) -> Book | None:
-    row = conn.execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
+    row = conn.execute(
+        """
+        SELECT
+            b.*,
+            COUNT(c.id) AS chapter_count,
+            COALESCE(SUM(c.word_count), 0) AS word_count
+        FROM books b
+        LEFT JOIN chapters c ON c.book_id = b.id AND c.deleted_at IS NULL
+        WHERE b.id = ?
+        GROUP BY b.id
+        """,
+        (book_id,),
+    ).fetchone()
     return _book_from_row(row) if row is not None else None
 
 
 def list_books(conn: sqlite3.Connection) -> list[Book]:
-    rows = conn.execute("SELECT * FROM books ORDER BY updated_at DESC, id ASC").fetchall()
+    rows = conn.execute(
+        """
+        SELECT
+            b.*,
+            COUNT(c.id) AS chapter_count,
+            COALESCE(SUM(c.word_count), 0) AS word_count
+        FROM books b
+        LEFT JOIN chapters c ON c.book_id = b.id AND c.deleted_at IS NULL
+        GROUP BY b.id
+        ORDER BY b.updated_at DESC, b.id ASC
+        """
+    ).fetchall()
     return [_book_from_row(row) for row in rows]
 
 
@@ -335,8 +398,15 @@ def create_chapter(
     return chapter
 
 
-def get_chapter(conn: sqlite3.Connection, chapter_id: str) -> Chapter | None:
-    row = conn.execute("SELECT * FROM chapters WHERE id = ?", (chapter_id,)).fetchone()
+def get_chapter(
+    conn: sqlite3.Connection, chapter_id: str, *, include_deleted: bool = False
+) -> Chapter | None:
+    sql = (
+        "SELECT * FROM chapters WHERE id = ?"
+        if include_deleted
+        else "SELECT * FROM chapters WHERE id = ? AND deleted_at IS NULL"
+    )
+    row = conn.execute(sql, (chapter_id,)).fetchone()
     return _chapter_from_row(row) if row is not None else None
 
 
@@ -345,21 +415,32 @@ def list_chapters(
     book_id: str,
     *,
     volume_id: str | None = None,
+    include_deleted: bool = False,
 ) -> list[Chapter]:
-    if volume_id is None:
-        rows = conn.execute(
-            "SELECT * FROM chapters WHERE book_id = ? ORDER BY sort_order ASC, created_at ASC",
-            (book_id,),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            """
-            SELECT * FROM chapters
-            WHERE book_id = ? AND volume_id = ?
-            ORDER BY sort_order ASC, created_at ASC
-            """,
-            (book_id, volume_id),
-        ).fetchall()
+    clauses = ["book_id = ?"]
+    params: list[str] = [book_id]
+    if not include_deleted:
+        clauses.append("deleted_at IS NULL")
+    if volume_id is not None:
+        clauses.append("volume_id = ?")
+        params.append(volume_id)
+    where_sql = " AND ".join(clauses)
+    rows = conn.execute(
+        f"SELECT * FROM chapters WHERE {where_sql} ORDER BY sort_order ASC, created_at ASC",
+        params,
+    ).fetchall()
+    return [_chapter_from_row(row) for row in rows]
+
+
+def list_deleted_chapters(conn: sqlite3.Connection, book_id: str) -> list[Chapter]:
+    rows = conn.execute(
+        """
+        SELECT * FROM chapters
+        WHERE book_id = ? AND deleted_at IS NOT NULL
+        ORDER BY deleted_at DESC, created_at DESC
+        """,
+        (book_id,),
+    ).fetchall()
     return [_chapter_from_row(row) for row in rows]
 
 
@@ -372,8 +453,9 @@ def update_chapter(
     content: str | Unset = UNSET,
     summary: str | Unset = UNSET,
     sort_order: int | Unset = UNSET,
+    deleted_at: str | None | Unset = UNSET,
 ) -> Chapter:
-    existing = get_chapter(conn, chapter_id)
+    existing = get_chapter(conn, chapter_id, include_deleted=True)
     if existing is None:
         raise LookupError(f"Chapter not found: {chapter_id}")
     new_title = existing.title if isinstance(title, Unset) else title
@@ -381,6 +463,7 @@ def update_chapter(
     new_volume_id = existing.volume_id if isinstance(volume_id, Unset) else volume_id
     new_summary = existing.summary if isinstance(summary, Unset) else summary
     new_sort_order = existing.sort_order if isinstance(sort_order, Unset) else sort_order
+    new_deleted_at = existing.deleted_at if isinstance(deleted_at, Unset) else deleted_at
     words = count_words(new_content)
     now = utc_now()
     with ensure_transaction(conn):
@@ -388,7 +471,7 @@ def update_chapter(
             """
             UPDATE chapters
             SET volume_id = ?, title = ?, content = ?, summary = ?,
-                word_count = ?, sort_order = ?, updated_at = ?
+                word_count = ?, sort_order = ?, updated_at = ?, deleted_at = ?
             WHERE id = ?
             """,
             (
@@ -399,28 +482,53 @@ def update_chapter(
                 words,
                 new_sort_order,
                 now,
+                new_deleted_at,
                 chapter_id,
             ),
         )
-        upsert_fts(
-            conn,
-            target_type=TargetType.CHAPTER,
-            target_id=chapter_id,
-            book_id=existing.book_id,
-            title=new_title,
-            body=new_content,
-        )
-    updated = get_chapter(conn, chapter_id)
+        if new_deleted_at is None:
+            upsert_fts(
+                conn,
+                target_type=TargetType.CHAPTER,
+                target_id=chapter_id,
+                book_id=existing.book_id,
+                title=new_title,
+                body=new_content,
+            )
+        else:
+            delete_fts(conn, target_type=TargetType.CHAPTER, target_id=chapter_id)
+    updated = get_chapter(conn, chapter_id, include_deleted=True)
     if updated is None:
         raise LookupError(f"Chapter not found after update: {chapter_id}")
     return updated
 
 
-def delete_chapter(conn: sqlite3.Connection, chapter_id: str) -> bool:
+def delete_chapter(conn: sqlite3.Connection, chapter_id: str, *, permanent: bool = False) -> bool:
     with ensure_transaction(conn):
         delete_fts(conn, target_type=TargetType.CHAPTER, target_id=chapter_id)
-        cursor = conn.execute("DELETE FROM chapters WHERE id = ?", (chapter_id,))
+        if permanent:
+            cursor = conn.execute("DELETE FROM chapters WHERE id = ?", (chapter_id,))
+        else:
+            now = utc_now()
+            cursor = conn.execute(
+                """
+                UPDATE chapters
+                SET deleted_at = ?, updated_at = ?
+                WHERE id = ? AND deleted_at IS NULL
+                """,
+                (now, now, chapter_id),
+            )
     return cursor.rowcount > 0
+
+
+def restore_chapter(conn: sqlite3.Connection, chapter_id: str) -> Chapter:
+    existing = get_chapter(conn, chapter_id, include_deleted=True)
+    if existing is None or existing.deleted_at is None:
+        raise LookupError(f"Deleted chapter not found: {chapter_id}")
+    target_volume_id = existing.volume_id
+    if target_volume_id is not None and get_volume(conn, target_volume_id) is None:
+        target_volume_id = None
+    return update_chapter(conn, chapter_id, volume_id=target_volume_id, deleted_at=None)
 
 
 def create_entry(
@@ -453,7 +561,7 @@ def create_entry(
                 book_id,
                 kind.value,
                 title,
-                category,
+                category.strip(),
                 content,
                 visibility.value,
                 normalized_meta,
@@ -462,6 +570,7 @@ def create_entry(
                 now,
             ),
         )
+        _ensure_entry_folder(conn, book_id=book_id, kind=kind, title=category, now=now)
         upsert_fts(
             conn,
             target_type=TargetType.ENTRY,
@@ -476,8 +585,15 @@ def create_entry(
     return entry
 
 
-def get_entry(conn: sqlite3.Connection, entry_id: str) -> Entry | None:
-    row = conn.execute("SELECT * FROM entries WHERE id = ?", (entry_id,)).fetchone()
+def get_entry(
+    conn: sqlite3.Connection, entry_id: str, *, include_deleted: bool = False
+) -> Entry | None:
+    sql = (
+        "SELECT * FROM entries WHERE id = ?"
+        if include_deleted
+        else "SELECT * FROM entries WHERE id = ? AND deleted_at IS NULL"
+    )
+    row = conn.execute(sql, (entry_id,)).fetchone()
     return _entry_from_row(row) if row is not None else None
 
 
@@ -487,9 +603,12 @@ def list_entries(
     *,
     kind: EntryKind | None = None,
     visibility: Visibility | None = None,
+    include_deleted: bool = False,
 ) -> list[Entry]:
     clauses = ["book_id = ?"]
     params: list[str] = [book_id]
+    if not include_deleted:
+        clauses.append("deleted_at IS NULL")
     if kind is not None:
         clauses.append("kind = ?")
         params.append(kind.value)
@@ -500,6 +619,18 @@ def list_entries(
     rows = conn.execute(
         f"SELECT * FROM entries WHERE {where_sql} ORDER BY sort_order ASC, created_at ASC",
         params,
+    ).fetchall()
+    return [_entry_from_row(row) for row in rows]
+
+
+def list_deleted_entries(conn: sqlite3.Connection, book_id: str) -> list[Entry]:
+    rows = conn.execute(
+        """
+        SELECT * FROM entries
+        WHERE book_id = ? AND deleted_at IS NOT NULL
+        ORDER BY deleted_at DESC, created_at DESC
+        """,
+        (book_id,),
     ).fetchall()
     return [_entry_from_row(row) for row in rows]
 
@@ -515,25 +646,27 @@ def update_entry(
     visibility: Visibility | Unset = UNSET,
     meta_json: str | Unset = UNSET,
     sort_order: int | Unset = UNSET,
+    deleted_at: str | None | Unset = UNSET,
 ) -> Entry:
-    existing = get_entry(conn, entry_id)
+    existing = get_entry(conn, entry_id, include_deleted=True)
     if existing is None:
         raise LookupError(f"Entry not found: {entry_id}")
     new_kind = existing.kind if isinstance(kind, Unset) else kind
     new_title = existing.title if isinstance(title, Unset) else title
-    new_category = existing.category if isinstance(category, Unset) else category
+    new_category = existing.category if isinstance(category, Unset) else category.strip()
     new_content = existing.content if isinstance(content, Unset) else content
     new_visibility = existing.visibility if isinstance(visibility, Unset) else visibility
     raw_meta = existing.meta_json if isinstance(meta_json, Unset) else meta_json
     normalized_meta = validate_entry_meta(new_kind, raw_meta)
     new_sort_order = existing.sort_order if isinstance(sort_order, Unset) else sort_order
+    new_deleted_at = existing.deleted_at if isinstance(deleted_at, Unset) else deleted_at
     now = utc_now()
     with ensure_transaction(conn):
         conn.execute(
             """
             UPDATE entries
             SET kind = ?, title = ?, category = ?, content = ?,
-                visibility = ?, meta_json = ?, sort_order = ?, updated_at = ?
+                visibility = ?, meta_json = ?, sort_order = ?, updated_at = ?, deleted_at = ?
             WHERE id = ?
             """,
             (
@@ -545,27 +678,180 @@ def update_entry(
                 normalized_meta,
                 new_sort_order,
                 now,
+                new_deleted_at,
                 entry_id,
             ),
         )
-        upsert_fts(
-            conn,
-            target_type=TargetType.ENTRY,
-            target_id=entry_id,
-            book_id=existing.book_id,
-            title=new_title,
-            body=new_content,
-        )
-    updated = get_entry(conn, entry_id)
+        if new_deleted_at is None:
+            _ensure_entry_folder(
+                conn, book_id=existing.book_id, kind=new_kind, title=new_category, now=now
+            )
+            upsert_fts(
+                conn,
+                target_type=TargetType.ENTRY,
+                target_id=entry_id,
+                book_id=existing.book_id,
+                title=new_title,
+                body=new_content,
+            )
+        else:
+            delete_fts(conn, target_type=TargetType.ENTRY, target_id=entry_id)
+    updated = get_entry(conn, entry_id, include_deleted=True)
     if updated is None:
         raise LookupError(f"Entry not found after update: {entry_id}")
     return updated
 
 
-def delete_entry(conn: sqlite3.Connection, entry_id: str) -> bool:
+def delete_entry(conn: sqlite3.Connection, entry_id: str, *, permanent: bool = False) -> bool:
     with ensure_transaction(conn):
         delete_fts(conn, target_type=TargetType.ENTRY, target_id=entry_id)
-        cursor = conn.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
+        if permanent:
+            cursor = conn.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
+        else:
+            now = utc_now()
+            cursor = conn.execute(
+                """
+                UPDATE entries
+                SET deleted_at = ?, updated_at = ?
+                WHERE id = ? AND deleted_at IS NULL
+                """,
+                (now, now, entry_id),
+            )
+    return cursor.rowcount > 0
+
+
+def restore_entry(conn: sqlite3.Connection, entry_id: str) -> Entry:
+    existing = get_entry(conn, entry_id, include_deleted=True)
+    if existing is None or existing.deleted_at is None:
+        raise LookupError(f"Deleted entry not found: {entry_id}")
+    return update_entry(conn, entry_id, deleted_at=None)
+
+
+def empty_trash(conn: sqlite3.Connection, book_id: str) -> int:
+    with ensure_transaction(conn):
+        chapters_cursor = conn.execute(
+            "DELETE FROM chapters WHERE book_id = ? AND deleted_at IS NOT NULL",
+            (book_id,),
+        )
+        entries_cursor = conn.execute(
+            "DELETE FROM entries WHERE book_id = ? AND deleted_at IS NOT NULL",
+            (book_id,),
+        )
+    return chapters_cursor.rowcount + entries_cursor.rowcount
+
+
+def list_entry_folders(
+    conn: sqlite3.Connection, book_id: str, *, kind: EntryKind | None = None
+) -> list[EntryFolder]:
+    if kind is None:
+        rows = conn.execute(
+            """
+            SELECT * FROM entry_folders
+            WHERE book_id = ?
+            ORDER BY sort_order ASC, created_at ASC
+            """,
+            (book_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT * FROM entry_folders
+            WHERE book_id = ? AND kind = ?
+            ORDER BY sort_order ASC, created_at ASC
+            """,
+            (book_id, kind.value),
+        ).fetchall()
+    return [_entry_folder_from_row(row) for row in rows]
+
+
+def get_entry_folder(conn: sqlite3.Connection, folder_id: str) -> EntryFolder | None:
+    row = conn.execute("SELECT * FROM entry_folders WHERE id = ?", (folder_id,)).fetchone()
+    return _entry_folder_from_row(row) if row is not None else None
+
+
+def create_entry_folder(
+    conn: sqlite3.Connection,
+    *,
+    book_id: str,
+    kind: EntryKind,
+    title: str,
+    description: str = "",
+    sort_order: int = 0,
+    folder_id: str | None = None,
+) -> EntryFolder:
+    now = utc_now()
+    resolved_id = folder_id or new_id()
+    clean_title = title.strip()
+    with ensure_transaction(conn):
+        conn.execute(
+            """
+            INSERT INTO entry_folders (
+                id, book_id, kind, title, description, sort_order, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (resolved_id, book_id, kind.value, clean_title, description, sort_order, now, now),
+        )
+    folder = get_entry_folder(conn, resolved_id)
+    if folder is None:
+        raise RuntimeError(f"Failed to load newly created entry folder {resolved_id}")
+    return folder
+
+
+def update_entry_folder(
+    conn: sqlite3.Connection,
+    folder_id: str,
+    *,
+    title: str | Unset = UNSET,
+    description: str | Unset = UNSET,
+    sort_order: int | Unset = UNSET,
+) -> EntryFolder:
+    existing = get_entry_folder(conn, folder_id)
+    if existing is None:
+        raise LookupError(f"Entry folder not found: {folder_id}")
+    new_title = existing.title if isinstance(title, Unset) else title.strip()
+    new_description = existing.description if isinstance(description, Unset) else description
+    new_sort_order = existing.sort_order if isinstance(sort_order, Unset) else sort_order
+    now = utc_now()
+    with ensure_transaction(conn):
+        conn.execute(
+            """
+            UPDATE entry_folders
+            SET title = ?, description = ?, sort_order = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (new_title, new_description, new_sort_order, now, folder_id),
+        )
+        if new_title != existing.title:
+            conn.execute(
+                """
+                UPDATE entries
+                SET category = ?, updated_at = ?
+                WHERE book_id = ? AND kind = ? AND category = ?
+                """,
+                (new_title, now, existing.book_id, existing.kind.value, existing.title),
+            )
+    updated = get_entry_folder(conn, folder_id)
+    if updated is None:
+        raise LookupError(f"Entry folder not found after update: {folder_id}")
+    return updated
+
+
+def delete_entry_folder(conn: sqlite3.Connection, folder_id: str) -> bool:
+    existing = get_entry_folder(conn, folder_id)
+    if existing is None:
+        return False
+    now = utc_now()
+    with ensure_transaction(conn):
+        conn.execute(
+            """
+            UPDATE entries
+            SET category = '', updated_at = ?
+            WHERE book_id = ? AND kind = ? AND category = ?
+            """,
+            (now, existing.book_id, existing.kind.value, existing.title),
+        )
+        cursor = conn.execute("DELETE FROM entry_folders WHERE id = ?", (folder_id,))
     return cursor.rowcount > 0
 
 
@@ -629,11 +915,13 @@ def search_book_content(
         """
         SELECT 'chapter' AS target_type, id AS target_id, book_id, title, content AS body
         FROM chapters
-        WHERE book_id = ? AND (title LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\')
+        WHERE book_id = ? AND deleted_at IS NULL
+          AND (title LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\')
         UNION ALL
         SELECT 'entry' AS target_type, id AS target_id, book_id, title, content AS body
         FROM entries
-        WHERE book_id = ? AND (title LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\')
+        WHERE book_id = ? AND deleted_at IS NULL
+          AND (title LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\')
         LIMIT ?
         """,
         (book_id, like_pattern, like_pattern, book_id, like_pattern, like_pattern, limit),

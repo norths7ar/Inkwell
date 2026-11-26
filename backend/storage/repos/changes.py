@@ -436,9 +436,9 @@ def restore_revision(
         if revision.target_type != target_type or revision.target_id != target_id:
             raise ValueError("Revision belongs to a different target")
         existing = (
-            get_chapter(conn, target_id)
+            get_chapter(conn, target_id, include_deleted=True)
             if target_type == TargetType.CHAPTER
-            else get_entry(conn, target_id)
+            else get_entry(conn, target_id, include_deleted=True)
         )
         if existing is not None and existing.book_id != revision.book_id:
             raise ValueError("Revision belongs to a different book")
@@ -487,6 +487,7 @@ def restore_revision(
                     sort_order=chapter_payload.sort_order
                     if chapter_payload.sort_order is not None
                     else UNSET,
+                    deleted_at=None,
                 )
         else:
             entry_payload = _EntryChangePayload.model_validate_json(revision.snapshot_json)
@@ -522,5 +523,6 @@ def restore_revision(
                     sort_order=entry_payload.sort_order
                     if entry_payload.sort_order is not None
                     else UNSET,
+                    deleted_at=None,
                 )
         return restored, record_content_revision(conn, restored, source=RevisionSource.RESTORE)

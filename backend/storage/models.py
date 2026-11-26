@@ -13,6 +13,7 @@ from backend.errors import ErrorInfo
 class EntryKind(StrEnum):
     CHARACTER = "character"
     WORLD = "world"
+    OUTLINE = "outline"
     NOTE = "note"
 
 
@@ -101,6 +102,7 @@ class NoteMeta(BaseModel):
 _ENTRY_META_MODELS: dict[EntryKind, type[BaseModel]] = {
     EntryKind.CHARACTER: CharacterMeta,
     EntryKind.WORLD: WorldMeta,
+    EntryKind.OUTLINE: NoteMeta,
     EntryKind.NOTE: NoteMeta,
 }
 
@@ -123,6 +125,8 @@ class Book:
     created_at: str
     updated_at: str
     cover_path: str = ""
+    chapter_count: int = 0
+    word_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,6 +152,7 @@ class Chapter:
     sort_order: int
     created_at: str
     updated_at: str
+    deleted_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +165,19 @@ class Entry:
     content: str
     visibility: Visibility
     meta_json: str
+    sort_order: int
+    created_at: str
+    updated_at: str
+    deleted_at: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EntryFolder:
+    id: str
+    book_id: str
+    kind: EntryKind
+    title: str
+    description: str
     sort_order: int
     created_at: str
     updated_at: str

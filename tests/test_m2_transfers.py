@@ -234,7 +234,8 @@ def test_rejected_archives_are_atomic_and_snapshot_contains_committed_wal_data()
             assert snapshot.status_code == 201
             record = TypeAdapter(BackupRecord).validate_json(snapshot.content)
             assert record.size_bytes > 0
-            assert not record.includes_attachments and not record.includes_encryption_key
+            assert record.kind == "zip" and record.includes_attachments
+            assert not record.includes_encryption_key
             status = TypeAdapter(SystemStatus).validate_json(
                 (await client.get("/api/system/status")).content
             )
@@ -242,19 +243,38 @@ def test_rejected_archives_are_atomic_and_snapshot_contains_committed_wal_data()
             assert status.database_bytes > 0 and status.backups == [record]
             assert len(list((Path(status.data_dir) / "attachments" / "covers").iterdir())) == 1
             assert Path(status.backups_dir).parent == Path(status.data_dir)
-            with closing(sqlite3.connect(Path(status.backups_dir) / record.name)) as backup_conn:
-                assert backup_conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
-                assert backup_conn.execute("SELECT title FROM books").fetchone() == (
-                    "Snapshot book",
-                )
-                assert backup_conn.execute("PRAGMA user_version").fetchone() == (
-                    status.schema_version,
-                )
+            backup_path = Path(status.backups_dir) / record.name
+            with zipfile.ZipFile(backup_path) as backup_zip:
+                names = set(backup_zip.namelist())
+                assert "inkwell.sqlite3" in names
+                assert any(name.startswith("attachments/covers/") for name in names)
+                extracted = Path(status.backups_dir) / "extracted.sqlite3"
+                extracted.write_bytes(backup_zip.read("inkwell.sqlite3"))
+                try:
+                    with closing(sqlite3.connect(extracted)) as backup_conn:
+                        assert backup_conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+                        assert backup_conn.execute("SELECT title FROM books").fetchone() == (
+                            "Snapshot book",
+                        )
+                        assert backup_conn.execute("PRAGMA user_version").fetchone() == (
+                            status.schema_version,
+                        )
+                finally:
+                    extracted.unlink(missing_ok=True)
             assert not list(Path(status.backups_dir).glob("*.partial"))
             listed = TypeAdapter(list[BackupRecord]).validate_json(
                 (await client.get("/api/backups")).content
             )
             assert listed == [record]
+            downloaded = await client.get(f"/api/backups/{record.name}")
+            assert downloaded.status_code == 200 and downloaded.content == backup_path.read_bytes()
+            assert (await client.delete(f"/api/backups/{record.name}")).status_code == 204
+            assert (
+                TypeAdapter(list[BackupRecord]).validate_json(
+                    (await client.get("/api/backups")).content
+                )
+                == []
+            )
             assert "secret" not in obj(await client.get("/api/system/status"))
 
     asyncio.run(scenario())

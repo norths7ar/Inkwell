@@ -50,15 +50,8 @@ class AppConfig:
 
 
 def default_data_dir() -> Path:
-    """Return the platform-standard per-user data directory."""
-    if os.name == "nt":
-        local_app_data = os.getenv("LOCALAPPDATA")
-        base = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
-        return base / "Inkwell"
-
-    xdg_data_home = os.getenv("XDG_DATA_HOME")
-    base = Path(xdg_data_home) if xdg_data_home else Path.home() / ".local" / "share"
-    return base / "inkwell"
+    """Return the repository-local data directory (overrideable via INKWELL_DATA_DIR)."""
+    return Path(__file__).resolve().parents[1] / "data"
 
 
 def _parse_port(raw_port: int | str) -> int:
