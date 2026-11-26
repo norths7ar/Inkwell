@@ -15,9 +15,17 @@ from backend.api.events import EventBus
 from backend.config import AppConfig
 from backend.crypto import create_cipher
 from backend.errors import exception_error
+from backend.llm._json import JsonObject
 from backend.llm.client import LLMClient
 from backend.llm.presets import build_endpoint_from_preset
-from backend.llm.types import EndpointConfig, TextBlock, WireProtocol
+from backend.llm.types import (
+    EndpointConfig,
+    GenerateRequest,
+    LLMMessage,
+    Role,
+    TextBlock,
+    WireProtocol,
+)
 from backend.storage.db import Database
 from backend.storage.migrations import ensure_transaction
 from backend.storage.models import MessageRole, ModelRecord, Provider, Run, RunStatus
@@ -29,6 +37,7 @@ class ActiveRun:
     run: Run
     steer: asyncio.Queue[str] = field(default_factory=asyncio.Queue)
     task: asyncio.Task[None] | None = None
+    auto_title: tuple[str, str] | None = None
 
 
 class ApiRuntime:
@@ -41,6 +50,7 @@ class ApiRuntime:
         self.conn: sqlite3.Connection
         self.runner = AgentRunner(self.db, llm)
         self.active: dict[str, ActiveRun] = {}
+        self.background_tasks: set[asyncio.Task[None]] = set()
 
     def open(self) -> None:
         self.config.ensure_data_dirs()
@@ -52,7 +62,10 @@ class ApiRuntime:
 
     async def close(self) -> None:
         self.events.close()
-        tasks = [entry.task for entry in self.active.values() if entry.task is not None]
+        tasks = [
+            *[entry.task for entry in self.active.values() if entry.task is not None],
+            *self.background_tasks,
+        ]
         for task in tasks:
             if not task.cancelling():
                 task.cancel()
@@ -60,6 +73,7 @@ class ApiRuntime:
         for entry in self.active.values():
             sessions.finish_run(self.conn, entry.run.id, status=RunStatus.CANCELLED)
         self.active.clear()
+        self.background_tasks.clear()
         await self.llm.aclose()
         self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         self.conn.close()
@@ -101,6 +115,78 @@ class ApiRuntime:
             raise HTTPException(422, "Model provider is disabled or missing")
         return model, self.endpoint(provider)
 
+    def _fallback_session_title(self, text: str) -> str:
+        for raw_line in text.splitlines():
+            collapsed = " ".join(raw_line.split()).strip("\"'“”‘’「」『』 ")
+            if collapsed:
+                return collapsed[:20]
+        return "新对话"
+
+    def _resolve_background_model(self) -> tuple[ModelRecord, EndpointConfig] | None:
+        for setting_key in ("background_model_id", "default_model_id"):
+            record_id = config.get_setting(self.conn, setting_key)
+            if not record_id:
+                continue
+            model = config.get_model(self.conn, record_id)
+            if model is None or not model.enabled:
+                continue
+            provider = config.get_provider(self.conn, model.provider_id)
+            if provider is None or not provider.enabled:
+                continue
+            return model, self.endpoint(provider)
+        return None
+
+    async def _generate_session_title(
+        self, session_id: str, book_id: str, expected_title: str, user_text: str
+    ) -> None:
+        try:
+            resolved = self._resolve_background_model()
+            if resolved is None:
+                return
+            model, endpoint = resolved
+            extra_body: JsonObject | None = (
+                {"thinking": {"type": "disabled"}}
+                if "deepseek" in endpoint.base_url.lower()
+                else None
+            )
+            response = await self.llm.complete(
+                endpoint,
+                GenerateRequest(
+                    model=model.model_id,
+                    messages=(
+                        LLMMessage.text(
+                            Role.USER,
+                            f"请为下面这段用户提问起一个 6~12 个字的简洁中文对话标题，直接输出标题文本，不要引号、标点或任何解释：\n\n「{user_text[:600]}」",
+                        ),
+                    ),
+                    protocol_override=WireProtocol(model.protocol_override.value)
+                    if model.protocol_override
+                    else None,
+                    max_output_tokens=1024,
+                    extra_body=extra_body,
+                ),
+            )
+            raw = "".join(block.text for block in response.blocks if isinstance(block, TextBlock))
+            first_line = next(
+                (line for line in raw.splitlines() if line.strip()),
+                "",
+            )
+            generated = (
+                " ".join(first_line.split())
+                .strip("\"'“”‘’「」 ")
+                .rstrip("。，、：:；;！!？?.")[:24]
+                .strip()
+            )
+            if not generated:
+                return
+            current = sessions.get_session(self.conn, session_id)
+            if current is None or current.title != expected_title:
+                return
+            sessions.update_session(self.conn, session_id, title=generated)
+            self.events.publish("content_changed", {"book_id": book_id, "session_id": session_id})
+        except Exception:
+            return
+
     def start(
         self, session_id: str, text: str, record_id: str | None, *, answer_to: str | None = None
     ) -> Run:
@@ -116,7 +202,12 @@ class ApiRuntime:
                 raise HTTPException(409, "Run is not waiting for an answer")
             if answer_to in self.active:
                 raise HTTPException(409, "Run is still finishing; retry the answer")
+        fallback_title: str | None = None
+        if answer_to is None and not session.title.strip():
+            fallback_title = self._fallback_session_title(text)
         with ensure_transaction(self.conn):
+            if fallback_title is not None:
+                sessions.update_session(self.conn, session_id, title=fallback_title)
             if answer_to is not None:
                 sessions.finish_run(self.conn, answer_to, status=RunStatus.COMPLETED)
             run = sessions.create_run(
@@ -130,7 +221,10 @@ class ApiRuntime:
                 role=MessageRole.USER,
                 blocks_json=serialize_blocks((TextBlock(text),)),
             )
-        active = ActiveRun(run)
+        active = ActiveRun(
+            run,
+            auto_title=(fallback_title, text) if fallback_title is not None else None,
+        )
         self.active[run.id] = active
         active.task = asyncio.create_task(self._execute(active, model, endpoint))
         return run
@@ -194,6 +288,15 @@ class ApiRuntime:
             )
         finally:
             self.active.pop(run.id, None)
+            if active.auto_title is not None:
+                expected_title, user_text = active.auto_title
+                title_task = asyncio.create_task(
+                    self._generate_session_title(
+                        run.session_id, run.book_id, expected_title, user_text
+                    )
+                )
+                self.background_tasks.add(title_task)
+                title_task.add_done_callback(self.background_tasks.discard)
 
     async def cancel(self, run_id: str) -> Run:
         run = sessions.get_run(self.conn, run_id)

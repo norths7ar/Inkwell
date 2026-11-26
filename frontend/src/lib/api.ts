@@ -26,7 +26,7 @@ async function parseResponse<T>(response: Response, schema: z.ZodType<T>): Promi
     if (parsed.success) {
       const { detail, error } = parsed.data;
       message = error
-        ? `${error.message}（${error.category}）`
+        ? error.message
         : typeof detail === "string"
           ? detail
           : detail?.map((item) => `${item.loc.join(".")}：${item.msg}`).join("；") || message;

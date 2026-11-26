@@ -298,9 +298,8 @@ function SettingsContent({
           if (!value && !busy) setDeleting(null);
         }}
         title="删除提供商"
-        description="同时删除其模型目录。已有会话消息和作品内容会保留。"
+        description={`确定删除「${deleting?.name ?? ""}」及其下的模型配置吗？不会影响作品与对话记录。`}
       >
-        <p>确定删除「{deleting?.name}」？默认模型若属于此提供商，删除后请重新选择。</p>
         <Alert>{error}</Alert>
         <div className="dialog-actions">
           <Button disabled={busy} onClick={() => setDeleting(null)}>
@@ -849,7 +848,7 @@ function ModelEditor({
     <form className="model-form" onSubmit={(event) => void save(event)}>
       <div className="stack model-form-scroll">
         <Input
-          label="模型名称（提供商 model ID）"
+          label="模型 ID"
           value={modelId}
           disabled={!!initial}
           onChange={(event) => setModelId(event.target.value)}

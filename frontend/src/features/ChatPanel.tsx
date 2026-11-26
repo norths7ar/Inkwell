@@ -1,18 +1,22 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import {
+  AlertCircle,
   ArrowUp,
   BookOpen,
+  Brain,
   Check,
+  ChevronRight,
   Globe,
   Lightbulb,
+  Loader2,
   Lock,
-  MessageSquarePlus,
   Pencil,
   PenLine,
   SearchCheck,
   Sparkles,
   Square,
+  SquarePen,
   Trash2,
 } from "lucide-react";
 import { z } from "zod";
@@ -29,6 +33,7 @@ import {
   Select,
   Textarea,
 } from "../components/ui";
+import { Markdown } from "../components/Markdown";
 import { errorText, remove, request } from "../lib/api";
 import { useConnection, useEvents } from "../lib/events";
 import {
@@ -51,8 +56,16 @@ const modes = [
   { value: "discuss", label: "讨论" },
   { value: "write", label: "写作" },
   { value: "review", label: "审阅" },
-];
+] as const;
+
+const modeLabels: Readonly<Record<Session["mode"], string>> = {
+  discuss: "讨论",
+  write: "写作",
+  review: "审阅",
+};
+
 const questionSchema = z.object({ question: z.string(), options: z.array(z.string()) });
+
 const toolNames: Readonly<Record<string, string>> = {
   list_chapters: "浏览章节目录",
   read_chapter: "读取章节",
@@ -61,8 +74,9 @@ const toolNames: Readonly<Record<string, string>> = {
   search_content: "搜索作品",
   propose_entry_edit: "提出设定修改",
   propose_chapter_edit: "提出章节修改",
-  ask_user: "请求你的决定",
+  ask_user: "确认问题",
 };
+
 const fieldNames: Readonly<Record<string, string>> = {
   title: "标题",
   content: "正文",
@@ -140,6 +154,57 @@ function toolSummary(content: string) {
   }
 }
 
+function toolHint(argumentsJson: string): string {
+  if (!argumentsJson.trim()) return "";
+  try {
+    const raw: unknown = JSON.parse(argumentsJson);
+    const parsed = z.record(z.string(), z.unknown()).safeParse(raw);
+    if (!parsed.success) return "";
+    const record = parsed.data;
+    for (const key of ["title", "query", "kind", "question", "category"]) {
+      const value = record[key];
+      if (typeof value === "string" && value.trim()) {
+        if (key === "kind") {
+          return value === "character"
+            ? "人物"
+            : value === "world"
+              ? "世界"
+              : value === "note"
+                ? "笔记"
+                : value;
+        }
+        return value.trim().slice(0, 28);
+      }
+    }
+  } catch {
+    /* Ignore incomplete JSON. */
+  }
+  return "";
+}
+
+function formatTokenCount(count: number): string {
+  if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
+  if (count >= 1_000) return `${(count / 1_000).toFixed(1)}K`;
+  return String(count);
+}
+
+function formatRelativeTime(iso: string): string {
+  if (!iso) return "";
+  const ts = Date.parse(iso);
+  if (Number.isNaN(ts)) return "";
+  const seconds = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (seconds < 60) return "刚刚";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days} 天前`;
+  const months = Math.floor(days / 30);
+  if (months < 12) return `大约 ${months} 个月前`;
+  return new Date(ts).toLocaleDateString("zh-CN");
+}
+
 function parseBlocks(message: Message) {
   try {
     const raw: unknown = JSON.parse(message.blocks_json);
@@ -149,50 +214,340 @@ function parseBlocks(message: Message) {
   }
 }
 
-function MessageContent({ message }: { message: Message }) {
-  const blocks = parseBlocks(message);
-  if (!blocks) return <Alert>这条历史消息格式无法识别。</Alert>;
+type ToolStep = {
+  kind: "tool";
+  callId: string;
+  name: string;
+  args: string;
+  result: string;
+  isError: boolean;
+  done: boolean;
+};
+
+type ProcessStep =
+  | { kind: "reasoning"; id: string; text: string }
+  | { kind: "note"; id: string; text: string }
+  | ToolStep;
+
+type DisplayTurn =
+  | { kind: "user"; id: string; text: string; malformed?: boolean }
+  | { kind: "assistant"; id: string; steps: ProcessStep[]; finalText: string; malformed?: boolean };
+
+function groupMessagesIntoTurns(messages: Message[]): DisplayTurn[] {
+  const turns: DisplayTurn[] = [];
+  let current: {
+    id: string;
+    segments: {
+      id: string;
+      hasToolCalls: boolean;
+      steps: ProcessStep[];
+      texts: string[];
+      malformed: boolean;
+    }[];
+    toolById: Map<string, ToolStep>;
+  } | null = null;
+
+  function flushAssistantTurn() {
+    if (!current) return;
+    const steps: ProcessStep[] = [];
+    let finalText = "";
+    const segments = current.segments;
+    const lastIdx = segments.length - 1;
+    const lastSeg = segments[lastIdx];
+    const hasFinalNoTool = Boolean(lastSeg && !lastSeg.hasToolCalls && lastSeg.texts.length > 0);
+    const hasMalformed = segments.some((seg) => seg.malformed);
+
+    segments.forEach((seg, idx) => {
+      for (const step of seg.steps) {
+        steps.push(step);
+      }
+      if (hasFinalNoTool && idx === lastIdx) {
+        finalText = seg.texts.join("\n\n");
+      } else if (seg.texts.length > 0) {
+        steps.push({ kind: "note", id: `${seg.id}:note`, text: seg.texts.join("\n\n") });
+      }
+    });
+
+    if (!finalText && steps.length > 0) {
+      const lastStep = steps.at(-1);
+      if (lastStep?.kind === "note") {
+        steps.pop();
+        finalText = lastStep.text;
+      }
+    }
+
+    turns.push({
+      kind: "assistant",
+      id: current.id,
+      steps,
+      finalText,
+      malformed: hasMalformed,
+    });
+    current = null;
+  }
+
+  for (const message of messages) {
+    const blocks = parseBlocks(message);
+    if (message.role === "user") {
+      flushAssistantTurn();
+      const userText = blocks
+        ? blocks
+            .map((block) =>
+              block.type === "text"
+                ? block.text
+                : block.type === "image"
+                  ? `[图片 · ${block.media_type}]`
+                  : "",
+            )
+            .filter(Boolean)
+            .join("\n")
+        : "";
+      turns.push({
+        kind: "user",
+        id: message.id,
+        text: userText,
+        malformed: blocks === null,
+      });
+      continue;
+    }
+
+    if (!current) {
+      current = { id: message.id, segments: [], toolById: new Map() };
+    }
+
+    if (!blocks) {
+      current.segments.push({
+        id: message.id,
+        hasToolCalls: false,
+        steps: [],
+        texts: [],
+        malformed: true,
+      });
+      continue;
+    }
+
+    if (message.role === "tool") {
+      for (const block of blocks) {
+        if (block.type !== "tool_result") continue;
+        const existing = current.toolById.get(block.call_id);
+        if (existing) {
+          existing.result = block.content;
+          existing.isError = block.is_error;
+          existing.done = true;
+        } else {
+          const orphan: ToolStep = {
+            kind: "tool",
+            callId: block.call_id,
+            name: block.name,
+            args: "",
+            result: block.content,
+            isError: block.is_error,
+            done: true,
+          };
+          current.toolById.set(block.call_id, orphan);
+          const lastSeg = current.segments.at(-1);
+          if (lastSeg) {
+            lastSeg.steps.push(orphan);
+          } else {
+            current.segments.push({
+              id: message.id,
+              hasToolCalls: true,
+              steps: [orphan],
+              texts: [],
+              malformed: false,
+            });
+          }
+        }
+      }
+      continue;
+    }
+
+    const segSteps: ProcessStep[] = [];
+    const texts: string[] = [];
+    let hasToolCalls = false;
+    blocks.forEach((block, index) => {
+      if (block.type === "reasoning" && block.text.trim()) {
+        segSteps.push({ kind: "reasoning", id: `${message.id}:r:${index}`, text: block.text });
+      } else if (block.type === "text" && block.text.trim()) {
+        texts.push(block.text);
+      } else if (block.type === "tool_call") {
+        hasToolCalls = true;
+        const step: ToolStep = {
+          kind: "tool",
+          callId: block.call_id,
+          name: block.name,
+          args: block.arguments_json,
+          result: "",
+          isError: false,
+          done: false,
+        };
+        current?.toolById.set(block.call_id, step);
+        segSteps.push(step);
+      } else if (block.type === "image") {
+        texts.push(`[图片 · ${block.media_type}]`);
+      }
+    });
+
+    current.segments.push({
+      id: message.id,
+      hasToolCalls,
+      steps: segSteps,
+      texts,
+      malformed: false,
+    });
+  }
+
+  flushAssistantTurn();
+  return turns;
+}
+
+function ToolStepRow({ step }: { step: ToolStep }) {
+  const [open, setOpen] = useState(false);
+  const hint = toolHint(step.args);
+  const hasDetails = Boolean(step.args.trim() && step.args.trim() !== "{}") || Boolean(step.result);
+
   return (
-    <article className={`message message-${message.role}`}>
-      <div className="message-label">
-        {message.role === "user" ? "你" : message.role === "tool" ? "工具结果" : "墨匣"}
-      </div>
-      {blocks.map((block, index) => {
-        if (block.type === "text")
-          return (
-            <div className="message-text" key={index}>
-              {block.text}
-            </div>
-          );
-        if (block.type === "reasoning")
-          return (
-            <details className="reasoning" key={index}>
-              <summary>思考过程</summary>
-              <div className="message-text muted">{block.text}</div>
-            </details>
-          );
-        if (block.type === "tool_call")
-          return (
-            <details className="tool-state" key={block.call_id}>
-              <summary>{toolName(block.name)}</summary>
-              <div className="tool-summary">{toolSummary(block.arguments_json)}</div>
-            </details>
-          );
-        if (block.type === "tool_result")
-          return (
-            <details className="tool-state" key={block.call_id}>
-              <summary>
-                {block.is_error ? "失败" : "已完成"} · {toolName(block.name)}
-              </summary>
-              <div className="tool-summary">{toolSummary(block.content)}</div>
-            </details>
-          );
-        return (
-          <div className="muted" key={index}>
-            图片消息（{block.media_type}）
-          </div>
-        );
-      })}
+    <div className={`process-tool ${step.isError ? "is-error" : ""}`}>
+      <button
+        type="button"
+        className="process-tool-trigger"
+        disabled={!hasDetails}
+        aria-expanded={hasDetails ? open : undefined}
+        onClick={() => {
+          if (hasDetails) setOpen((value) => !value);
+        }}
+      >
+        <span className="process-tool-icon" aria-hidden="true">
+          {!step.done ? (
+            <Loader2 size={12} className="spin" />
+          ) : step.isError ? (
+            <AlertCircle size={12} />
+          ) : (
+            <Check size={12} />
+          )}
+        </span>
+        <span className="process-tool-name">{toolName(step.name)}</span>
+        {hint && <span className="process-tool-hint">{hint}</span>}
+        {hasDetails && (
+          <ChevronRight size={12} className={`process-chevron ${open ? "is-open" : ""}`} />
+        )}
+      </button>
+      {open && hasDetails && (
+        <div className="process-tool-body">
+          {step.args.trim() && step.args.trim() !== "{}" && (
+            <div className="process-tool-detail">{toolSummary(step.args)}</div>
+          )}
+          {step.result && <div className="process-tool-detail">{toolSummary(step.result)}</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ProcessDisclosure({
+  steps,
+  streaming = false,
+  defaultOpen = false,
+}: {
+  steps: ProcessStep[];
+  streaming?: boolean;
+  defaultOpen?: boolean;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  const wasStreamingRef = useRef(streaming);
+  const userToggledRef = useRef(false);
+
+  useEffect(() => {
+    if (streaming) {
+      wasStreamingRef.current = true;
+      if (!userToggledRef.current) setOpen(true);
+      return;
+    }
+    if (wasStreamingRef.current) {
+      wasStreamingRef.current = false;
+      if (!userToggledRef.current) setOpen(false);
+    }
+  }, [streaming]);
+
+  if (steps.length === 0) return null;
+
+  const hasReasoning = steps.some((step) => step.kind === "reasoning");
+  const tools = steps.filter((step): step is ToolStep => step.kind === "tool");
+  const runningTool = tools.find((tool) => !tool.done);
+
+  let label = "思考过程";
+  if (streaming) {
+    if (runningTool) {
+      label = `正在${toolName(runningTool.name)}…`;
+    } else if (hasReasoning) {
+      label = "正在思考…";
+    } else {
+      label = "正在整理…";
+    }
+  } else if (hasReasoning && tools.length > 0) {
+    label = `已思考 · 调用 ${tools.length} 项工具`;
+  } else if (tools.length > 0) {
+    label = `已调用 ${tools.length} 项工具`;
+  }
+
+  return (
+    <div className={`process-block ${streaming ? "is-streaming" : ""}`}>
+      <button
+        type="button"
+        className="process-toggle"
+        aria-expanded={open}
+        onClick={() => {
+          userToggledRef.current = true;
+          setOpen((value) => !value);
+        }}
+      >
+        <Brain size={13} className="process-toggle-icon" />
+        <span>{label}</span>
+        <ChevronRight size={13} className={`process-chevron ${open ? "is-open" : ""}`} />
+      </button>
+      {open && (
+        <div className="process-timeline">
+          {steps.map((step) => {
+            if (step.kind === "reasoning") {
+              return (
+                <div className="process-reasoning" key={step.id}>
+                  <Markdown content={step.text} />
+                </div>
+              );
+            }
+            if (step.kind === "note") {
+              return (
+                <div className="process-note" key={step.id}>
+                  <Markdown content={step.text} />
+                </div>
+              );
+            }
+            return <ToolStepRow key={step.callId} step={step} />;
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TurnView({ turn }: { turn: DisplayTurn }) {
+  if (turn.kind === "user") {
+    return (
+      <article className="message message-user">
+        {turn.malformed ? (
+          <Alert>这条历史消息格式无法识别。</Alert>
+        ) : (
+          <div className="message-user-text">{turn.text}</div>
+        )}
+      </article>
+    );
+  }
+
+  return (
+    <article className="message message-assistant">
+      {turn.malformed && <Alert>这条历史消息格式无法识别。</Alert>}
+      <ProcessDisclosure steps={turn.steps} />
+      {turn.finalText && <Markdown content={turn.finalText} className="message-markdown" />}
     </article>
   );
 }
@@ -202,29 +557,209 @@ type LiveTurn = { runId: string; text: string; reasoning: string; tools: ToolSta
 type LiveQuestion = { runId: string; question: string; options: string[] };
 const emptyTurn = (): LiveTurn => ({ runId: "", text: "", reasoning: "", tools: [] });
 
+function ComposerArea({
+  text,
+  onTextChange,
+  mode,
+  onModeChange,
+  modelId,
+  onModelChange,
+  models,
+  visibilityScope,
+  onVisibilityChange,
+  visibilityPermanent,
+  running,
+  waiting,
+  locked,
+  busy,
+  availableModel,
+  inputRef,
+  onSend,
+  onSteer,
+  runStatusText,
+  canCancel,
+  onCancel,
+}: {
+  text: string;
+  onTextChange: (value: string) => void;
+  mode: Session["mode"];
+  onModeChange: (value: Session["mode"]) => void;
+  modelId: string;
+  onModelChange: (value: string) => void;
+  models: Model[];
+  visibilityScope: Session["visibility_scope"];
+  onVisibilityChange: (next: Session["visibility_scope"]) => void;
+  visibilityPermanent: boolean;
+  running: boolean;
+  waiting: boolean;
+  locked: boolean;
+  busy: boolean;
+  availableModel: boolean;
+  inputRef?: React.RefObject<HTMLTextAreaElement | null>;
+  onSend: () => void;
+  onSteer?: () => void;
+  runStatusText?: string;
+  canCancel?: boolean;
+  onCancel?: () => void;
+}) {
+  return (
+    <div className="chat-composer-area">
+      {(waiting || running) && runStatusText && (
+        <div className="chat-run-status">
+          <span>{runStatusText}</span>
+          {canCancel && onCancel && (
+            <Button variant="ghost" disabled={busy} onClick={onCancel}>
+              <Square size={13} />
+              停止生成
+            </Button>
+          )}
+        </div>
+      )}
+      <div className="chat-composer">
+        <Textarea
+          ref={inputRef}
+          aria-label={running ? "中途补充要求" : "输入消息"}
+          placeholder={running ? "补充一句…" : "输入想法或写作要求…"}
+          value={text}
+          onChange={(event) => onTextChange(event.target.value)}
+          disabled={waiting}
+          rows={3}
+          onKeyDown={(event) => {
+            if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && !running) {
+              event.preventDefault();
+              onSend();
+            }
+          }}
+        />
+        <div className="composer-footer">
+          <div className="composer-options">
+            <Select
+              compact
+              label="创作模式"
+              value={mode}
+              disabled={locked}
+              icon={
+                mode === "discuss" ? (
+                  <Lightbulb size={12} />
+                ) : mode === "write" ? (
+                  <PenLine size={12} />
+                ) : (
+                  <SearchCheck size={12} />
+                )
+              }
+              options={[...modes]}
+              onChange={(value) => onModeChange(modeSchema.parse(value))}
+            />
+            <Select
+              compact
+              label="协作模型"
+              value={modelId}
+              disabled={running || busy}
+              icon={<Sparkles size={12} />}
+              options={[
+                { value: "default", label: "默认模型" },
+                ...models
+                  .filter((model) => model.enabled)
+                  .map((model) => ({
+                    value: model.id,
+                    label: model.display_name || model.model_id,
+                  })),
+              ]}
+              onChange={onModelChange}
+            />
+          </div>
+          <div className="composer-actions">
+            {visibilityPermanent && visibilityScope === "global" ? (
+              <button
+                type="button"
+                className="composer-visibility-pill is-global"
+                disabled
+                title="已开启全局资料，本对话中不可退回仅公开"
+              >
+                <Globe size={12} />
+                <span>全局</span>
+                <Lock size={10} />
+              </button>
+            ) : (
+              <button
+                type="button"
+                className={`composer-visibility-pill ${visibilityScope === "global" ? "is-global" : ""}`}
+                disabled={locked}
+                title={
+                  visibilityScope === "global"
+                    ? "点击切回仅公开资料"
+                    : "当前仅读取公开资料；点击开启全局资料（开启后本对话不可退回）"
+                }
+                onClick={() =>
+                  onVisibilityChange(visibilityScope === "global" ? "local" : "global")
+                }
+              >
+                {visibilityScope === "global" ? <Globe size={12} /> : <BookOpen size={12} />}
+                <span>{visibilityScope === "global" ? "全局" : "仅公开"}</span>
+              </button>
+            )}
+            {running && onSteer ? (
+              <Button
+                variant="primary"
+                className="composer-send"
+                aria-label="插话"
+                title="插话"
+                disabled={busy || !text.trim()}
+                onClick={onSteer}
+              >
+                <ArrowUp size={16} />
+              </Button>
+            ) : (
+              <Button
+                variant="primary"
+                className="composer-send"
+                aria-label="发送"
+                title="发送 · Ctrl+Enter"
+                disabled={locked || !text.trim() || !availableModel}
+                onClick={onSend}
+              >
+                <ArrowUp size={16} />
+              </Button>
+            )}
+          </div>
+        </div>
+      </div>
+      {!availableModel && !waiting && <p className="chat-model-warning">尚未配置可用模型</p>}
+    </div>
+  );
+}
+
 function SessionChat({
   session,
   models,
   defaultModelId,
+  modelId,
+  onModelChange,
+  initialRuns,
+  onRunsChange,
   onUpdated,
   onPending,
+  inputRef,
 }: {
   session: Session;
   models: Model[];
   defaultModelId: string | null;
+  modelId: string;
+  onModelChange: (value: string) => void;
+  initialRuns?: Run[];
+  onRunsChange: (runs: Run[]) => void;
   onUpdated: (session: Session) => void;
   onPending: (id: string) => void;
+  inputRef: React.RefObject<HTMLTextAreaElement | null>;
 }) {
   const [messages, setMessages] = useState<Message[]>([]);
-  const [runs, setRuns] = useState<Run[]>([]);
+  const [runs, setRuns] = useState<Run[]>(initialRuns ?? []);
   const [live, setLive] = useState<LiveTurn>(emptyTurn);
   const [text, setText] = useState("");
   const [answer, setAnswer] = useState("");
-  const [modelId, setModelId] = useState("default");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
-  const [confirmGlobal, setConfirmGlobal] = useState(false);
   const [loading, setLoading] = useState(true);
   const [pending, setPending] = useState<{ id: string; title: string }[]>([]);
   const mounted = useRef(true);
@@ -235,6 +770,8 @@ function SessionChat({
   const [finishedIds, setFinishedIds] = useState<string[]>([]);
   const historyElement = useRef<HTMLDivElement>(null);
   const followOutput = useRef(true);
+  const onRunsChangeRef = useRef(onRunsChange);
+  onRunsChangeRef.current = onRunsChange;
 
   useEffect(() => {
     const element = historyElement.current;
@@ -252,6 +789,7 @@ function SessionChat({
       if (!mounted.current || sequence !== fetchSequence.current) return;
       setMessages(history);
       setRuns(records);
+      onRunsChangeRef.current(records);
       setLive((old) =>
         records.some((run) => run.id === old.runId && run.status !== "running") ? emptyTurn() : old,
       );
@@ -285,7 +823,7 @@ function SessionChat({
         return;
       }
       if (event.type === "content_changed") {
-        if (event.session_id === session.id) void refresh();
+        if (event.resource !== "session_deleted" && event.session_id === session.id) void refresh();
         return;
       }
       if (event.session_id !== session.id) return;
@@ -332,7 +870,7 @@ function SessionChat({
       } else if (event.type === "pending_change_created") {
         setPending((old) => [
           ...old.filter((item) => item.id !== event.change.id),
-          { id: event.change.id, title: event.change.title || "待审变更" },
+          { id: event.change.id, title: event.change.title || "待审建议" },
         ]);
       } else if (event.type === "waiting_user" || event.type === "run_done") {
         setEventRunning(false);
@@ -345,7 +883,7 @@ function SessionChat({
         } else {
           setLiveQuestion(null);
           setFinishedIds((old) => [...old.filter((id) => id !== event.run_id), event.run_id]);
-          if (event.error) setNotice(`${event.error.message}（${event.error.category}）`);
+          if (event.error) setNotice(event.error.message);
         }
         void refresh();
       }
@@ -369,11 +907,31 @@ function SessionChat({
       const raw: unknown = JSON.parse(persistedWaiting.pending_question_json);
       question = questionSchema.parse(raw);
     } catch {
-      /* The persisted run remains cancellable if its question is malformed. */
+      /* Malformed question falls back to generic prompt. */
     }
   }
   const effectiveModel = modelId === "default" ? defaultModelId : modelId;
   const availableModel = models.some((model) => model.id === effectiveModel && model.enabled);
+
+  const turns = useMemo(() => groupMessagesIntoTurns(messages), [messages]);
+  const liveSteps: ProcessStep[] = [];
+  if (live.reasoning) {
+    liveSteps.push({ kind: "reasoning", id: "live-reasoning", text: live.reasoning });
+  }
+  for (const tool of live.tools) {
+    if (tool.status === "running") {
+      liveSteps.push({
+        kind: "tool",
+        callId: tool.id,
+        name: tool.name,
+        args: "",
+        result: "",
+        isError: false,
+        done: false,
+      });
+    }
+  }
+  const showLiveStream = Boolean(live.text) || liveSteps.length > 0;
 
   async function perform(action: () => Promise<void>) {
     setBusy(true);
@@ -397,7 +955,11 @@ function SessionChat({
       });
       if (!mounted.current) return;
       setText((current) => (current === sent ? "" : current));
-      setRuns((old) => [run, ...old.filter((item) => item.id !== run.id)]);
+      setRuns((old) => {
+        const next = [run, ...old.filter((item) => item.id !== run.id)];
+        onRunsChangeRef.current(next);
+        return next;
+      });
       await refresh();
     });
   }
@@ -413,7 +975,11 @@ function SessionChat({
       if (!mounted.current) return;
       setLiveQuestion(null);
       setAnswer((current) => (current === sent ? "" : current));
-      setRuns((old) => [run, ...old.filter((item) => item.id !== waiting && item.id !== run.id)]);
+      setRuns((old) => {
+        const next = [run, ...old.filter((item) => item.id !== waiting && item.id !== run.id)];
+        onRunsChangeRef.current(next);
+        return next;
+      });
       await refresh();
     });
   }
@@ -429,7 +995,7 @@ function SessionChat({
             void refresh();
           }}
         >
-          重新载入会话
+          重新载入对话
         </Button>
       )}
       <div
@@ -443,42 +1009,29 @@ function SessionChat({
         }}
       >
         {loading ? (
-          <p className="muted">正在载入会话…</p>
+          <p className="muted">正在载入对话…</p>
         ) : (
-          messages.length === 0 && <EmptyState title="暂无消息" />
+          turns.length === 0 && !showLiveStream && <EmptyState title="暂无消息" />
         )}
-        {messages.map((message) => (
-          <MessageContent key={message.id} message={message} />
+        {turns.map((turn) => (
+          <TurnView key={turn.id} turn={turn} />
         ))}
-        {(live.text || live.reasoning) && (
-          <article className="message stream" aria-label="正在生成">
-            <div className="message-label">墨匣 · {running ? "生成中" : "同步中"}</div>
-            {live.reasoning && (
-              <details className="reasoning">
-                <summary>思考过程</summary>
-                <div className="message-text muted">{live.reasoning}</div>
-              </details>
-            )}
-            {live.text && <div className="message-text">{live.text}</div>}
+        {showLiveStream && (
+          <article className="message message-assistant stream" aria-label="正在生成">
+            <ProcessDisclosure
+              steps={liveSteps}
+              streaming={running && !live.text}
+              defaultOpen={!live.text}
+            />
+            {live.text && <Markdown content={live.text} className="message-markdown" />}
           </article>
-        )}
-        {live.tools.some((tool) => tool.status === "running") && (
-          <div className="tool-state">
-            {live.tools
-              .filter((tool) => tool.status === "running")
-              .map((tool) => (
-                <div key={tool.id}>
-                  <Badge>执行中</Badge> {toolName(tool.name)}
-                </div>
-              ))}
-          </div>
         )}
         {pending.length > 0 && (
           <div className="stack">
-            <span className="section-title">本次待审建议</span>
+            <span className="section-title">待审建议</span>
             {pending.map((item) => (
               <Button key={item.id} onClick={() => onPending(item.id)}>
-                {item.title} · 查看变更
+                {item.title} · 去审阅
               </Button>
             ))}
           </div>
@@ -488,17 +1041,11 @@ function SessionChat({
             {notice}
           </p>
         )}
-        {latest?.status === "failed" && latest.error && (
-          <Alert>
-            {latest.error.message}（{latest.error.category}）
-            {latest.error.retry_after_seconds !== null &&
-              ` 建议 ${latest.error.retry_after_seconds} 秒后重试。`}
-          </Alert>
-        )}
+        {latest?.status === "failed" && latest.error && <Alert>{latest.error.message}</Alert>}
         {waiting && (
-          <section className="question-card stack" aria-label="等待你的回答">
+          <section className="question-card stack" aria-label="等待你的决定">
             <Badge tone="warning">需要你的决定</Badge>
-            <p>{question?.question || "这次运行正在等待回答。"}</p>
+            <Markdown content={question?.question || "请选择或输入你的想法以继续。"} />
             {question && question.options.length > 0 && (
               <div className="row">
                 {question.options.map((option, index) => (
@@ -509,7 +1056,7 @@ function SessionChat({
               </div>
             )}
             <Textarea
-              label="你的回答"
+              label="你的想法"
               value={answer}
               onChange={(event) => setAnswer(event.target.value)}
               rows={3}
@@ -521,196 +1068,79 @@ function SessionChat({
                 void reply();
               }}
             >
-              回答并继续
+              继续对话
             </Button>
           </section>
         )}
       </div>
-      <div className="chat-composer-area">
-        {(waiting || running) && (
-          <div className="chat-run-status">
-            <span>{waiting ? "等待回答" : "正在生成…"}</span>
-            {(active || eventRunning || waiting) && (
-              <Button
-                variant="ghost"
-                disabled={busy || (!active && !live.runId && !waiting)}
-                onClick={() => {
-                  const id = waiting || active?.id || live.runId;
-                  if (!id) return;
-                  void perform(async () => {
-                    await request(`/runs/${id}/cancel`, runSchema, { method: "POST" });
-                    setEventRunning(false);
-                    setLiveQuestion(null);
-                    setFinishedIds((old) => [...old.filter((item) => item !== id), id]);
-                    setLive(emptyTurn());
-                    await refresh();
-                  });
-                }}
-              >
-                <Square size={14} />
-                取消运行
-              </Button>
-            )}
-          </div>
-        )}
-        <div className="chat-composer">
-          <Textarea
-            aria-label={running ? "中途补充指令" : "写作指令"}
-            placeholder={running ? "补充指令…" : "输入消息…"}
-            value={text}
-            onChange={(event) => setText(event.target.value)}
-            disabled={Boolean(waiting)}
-            rows={3}
-            onKeyDown={(event) => {
-              if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && !running) {
-                event.preventDefault();
-                void send();
-              }
-            }}
-          />
-          <div className="composer-footer">
-            <div className="composer-options">
-              <Select
-                compact
-                label="创作模式"
-                value={session.mode}
-                disabled={locked}
-                icon={
-                  session.mode === "discuss" ? (
-                    <Lightbulb size={12} />
-                  ) : session.mode === "write" ? (
-                    <PenLine size={12} />
-                  ) : (
-                    <SearchCheck size={12} />
-                  )
-                }
-                options={modes}
-                onChange={(value) => {
-                  void perform(async () =>
-                    onUpdated(
-                      await request(`/sessions/${session.id}`, sessionSchema, {
-                        method: "PATCH",
-                        body: { mode: modeSchema.parse(value) },
-                      }),
-                    ),
-                  );
-                }}
-              />
-              <Select
-                compact
-                label="协作模型"
-                value={modelId}
-                disabled={running || busy}
-                icon={<Sparkles size={12} />}
-                options={[
-                  { value: "default", label: "默认模型" },
-                  ...models
-                    .filter((model) => model.enabled)
-                    .map((model) => ({
-                      value: model.id,
-                      label: model.display_name || model.model_id,
-                    })),
-                ]}
-                onChange={setModelId}
-              />
-            </div>
-            <div className="composer-actions">
-              {session.visibility_scope === "global" ? (
-                <button
-                  type="button"
-                  className="composer-visibility-pill is-global"
-                  disabled
-                  title="当前会话已开启全局资料，不可退回仅公开"
-                >
-                  <Globe size={12} />
-                  <span>全局</span>
-                  <Lock size={10} />
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  className="composer-visibility-pill"
-                  disabled={locked}
-                  title="当前仅读取公开设定；点击可开启全局资料（不可逆）"
-                  onClick={() => setConfirmGlobal(true)}
-                >
-                  <BookOpen size={12} />
-                  <span>仅公开</span>
-                </button>
-              )}
-              {running ? (
-                <Button
-                  variant="primary"
-                  className="composer-send"
-                  aria-label="插话"
-                  title="插话"
-                  disabled={busy || !text.trim()}
-                  onClick={() => {
-                    const id = active?.id || live.runId;
-                    if (!id) return;
-                    const sent = text;
-                    void perform(async () => {
-                      await request(
-                        `/runs/${id}/steer`,
-                        z.object({ run_id: z.string(), status: z.string() }),
-                        { method: "POST", body: { text: sent } },
-                      );
-                      setText((current) => (current === sent ? "" : current));
-                    });
-                  }}
-                >
-                  <ArrowUp size={16} />
-                </Button>
-              ) : (
-                <Button
-                  variant="primary"
-                  className="composer-send"
-                  aria-label="发送"
-                  title="发送 · Ctrl+Enter"
-                  disabled={locked || !text.trim() || !availableModel}
-                  onClick={() => {
-                    void send();
-                  }}
-                >
-                  <ArrowUp size={16} />
-                </Button>
-              )}
-            </div>
-          </div>
-        </div>
-        {!availableModel && !waiting && <p className="chat-model-warning">尚未配置可用模型</p>}
-      </div>
-      <Dialog
-        title="开启全局资料"
-        description="开启后，AI 在本会话中可查阅所有隐藏设定；由于对话上下文已包含隐藏内容，开启后无法退回「仅公开资料」。"
-        open={confirmGlobal}
-        onOpenChange={(open) => {
-          if (!open && !busy) setConfirmGlobal(false);
+      <ComposerArea
+        text={text}
+        onTextChange={setText}
+        mode={session.mode}
+        onModeChange={(nextMode) => {
+          void perform(async () =>
+            onUpdated(
+              await request(`/sessions/${session.id}`, sessionSchema, {
+                method: "PATCH",
+                body: { mode: nextMode },
+              }),
+            ),
+          );
         }}
-      >
-        <Alert>{error}</Alert>
-        <div className="dialog-actions">
-          <Button disabled={busy} onClick={() => setConfirmGlobal(false)}>
-            取消
-          </Button>
-          <Button
-            variant="primary"
-            disabled={busy}
-            onClick={() => {
-              void perform(async () => {
-                const updated = await request(`/sessions/${session.id}`, sessionSchema, {
-                  method: "PATCH",
-                  body: { visibility_scope: "global" },
-                });
-                onUpdated(updated);
-                setConfirmGlobal(false);
-              });
-            }}
-          >
-            {busy ? "开启中…" : "开启全局资料"}
-          </Button>
-        </div>
-      </Dialog>
+        modelId={modelId}
+        onModelChange={onModelChange}
+        models={models}
+        visibilityScope={session.visibility_scope}
+        onVisibilityChange={(nextScope) => {
+          if (nextScope !== "global" || session.visibility_scope === "global") return;
+          void perform(async () =>
+            onUpdated(
+              await request(`/sessions/${session.id}`, sessionSchema, {
+                method: "PATCH",
+                body: { visibility_scope: "global" },
+              }),
+            ),
+          );
+        }}
+        visibilityPermanent
+        running={running}
+        waiting={Boolean(waiting)}
+        locked={locked}
+        busy={busy}
+        availableModel={availableModel}
+        inputRef={inputRef}
+        onSend={() => void send()}
+        onSteer={() => {
+          const id = active?.id || live.runId;
+          if (!id) return;
+          const sent = text;
+          void perform(async () => {
+            await request(
+              `/runs/${id}/steer`,
+              z.object({ run_id: z.string(), status: z.string() }),
+              {
+                method: "POST",
+                body: { text: sent },
+              },
+            );
+            setText((current) => (current === sent ? "" : current));
+          });
+        }}
+        runStatusText={waiting ? "等待你的决定" : running ? "正在生成…" : undefined}
+        canCancel={Boolean(active || eventRunning || waiting)}
+        onCancel={() => {
+          const id = waiting || active?.id || live.runId;
+          if (!id) return;
+          void perform(async () => {
+            await request(`/runs/${id}/cancel`, runSchema, { method: "POST" });
+            setEventRunning(false);
+            setLiveQuestion(null);
+            setFinishedIds((old) => [...old.filter((item) => item !== id), id]);
+            setLive(emptyTurn());
+            await refresh();
+          });
+        }}
+      />
     </>
   );
 }
@@ -732,17 +1162,30 @@ function BookChat({
 }: ChatPanelProps) {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [sessionId, setSessionId] = useState("");
+  const [drafting, setDrafting] = useState(false);
+  const [draftText, setDraftText] = useState("");
+  const [draftMode, setDraftMode] = useState<Session["mode"]>("discuss");
+  const [draftModelId, setDraftModelId] = useState("default");
+  const [draftVisibility, setDraftVisibility] = useState<Session["visibility_scope"]>("local");
+  const [runsBySession, setRunsBySession] = useState<Record<string, Run[]>>({});
   const [models, setModels] = useState<Model[]>([]);
   const [defaultModelId, setDefaultModelId] = useState<string | null>(null);
   const [error, setError] = useState("");
-  const [editing, setEditing] = useState<"new" | "rename" | "delete" | null>(null);
+  const [editing, setEditing] = useState<"rename" | "delete" | null>(null);
   const [editingId, setEditingId] = useState("");
   const [title, setTitle] = useState("");
   const [busy, setBusy] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const sequence = useRef(0);
   const mounted = useRef(true);
+  const draftingRef = useRef(false);
+  draftingRef.current = drafting;
+  const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
   const connection = useConnection();
+
+  const focusComposer = useCallback(() => {
+    window.setTimeout(() => composerInputRef.current?.focus(), 0);
+  }, []);
 
   const refresh = useCallback(async () => {
     const current = ++sequence.current;
@@ -754,7 +1197,10 @@ function BookChat({
       ]);
       if (!mounted.current || current !== sequence.current) return;
       setSessions(items);
-      setSessionId((old) => (items.some((item) => item.id === old) ? old : items[0]?.id || ""));
+      setSessionId((old) => {
+        if (draftingRef.current) return "";
+        return items.some((item) => item.id === old) ? old : items[0]?.id || "";
+      });
       setModels(catalogue);
       setDefaultModelId(settings.default_model_id);
       setLoaded(true);
@@ -765,6 +1211,7 @@ function BookChat({
       }
     }
   }, [bookId]);
+
   useEffect(() => {
     mounted.current = true;
     void refresh();
@@ -773,6 +1220,7 @@ function BookChat({
       sequence.current += 1;
     };
   }, [refresh]);
+
   useEvents(
     useCallback(
       (event: ServerEvent) => {
@@ -787,32 +1235,49 @@ function BookChat({
       [bookId, refresh],
     ),
   );
+
   const selected = sessions.find((session) => session.id === sessionId);
   const editingSession = sessions.find((session) => session.id === editingId);
+  const selectedRuns = selected ? runsBySession[selected.id] : undefined;
+
+  function openNewBlankChat() {
+    setError("");
+    setDrafting(true);
+    setSessionId("");
+    focusComposer();
+  }
+
+  function selectExistingSession(id: string) {
+    setDrafting(false);
+    setSessionId(id);
+  }
+
   function editSession(action: "rename" | "delete", session: Session) {
     setEditingId(session.id);
     setTitle(session.title);
     setEditing(action);
   }
-  async function saveSession() {
+
+  async function saveSessionAction() {
+    if (!editing || !editingSession) {
+      setEditing(null);
+      return;
+    }
     setBusy(true);
     setError("");
     try {
-      if (editing !== "new" && !editingSession) throw new Error("会话已被删除。");
-      if (editing === "delete" && editingSession) {
-        await remove(`/sessions/${editingSession.id}`);
+      if (editing === "delete") {
+        const removedId = editingSession.id;
+        await remove(`/sessions/${removedId}`);
+        setSessions((old) => old.filter((item) => item.id !== removedId));
+        if (sessionId === removedId) {
+          setSessionId("");
+        }
       } else {
-        const item = await request(
-          editing === "rename" && editingSession
-            ? `/sessions/${editingSession.id}`
-            : `/books/${bookId}/sessions`,
-          sessionSchema,
-          {
-            method: editing === "rename" ? "PATCH" : "POST",
-            body: { title: title.trim() || "新会话" },
-          },
-        );
-        if (mounted.current && editing === "new") setSessionId(item.id);
+        await request(`/sessions/${editingSession.id}`, sessionSchema, {
+          method: "PATCH",
+          body: { title: title.trim() || "未命名对话" },
+        });
       }
       if (mounted.current) {
         setEditing(null);
@@ -824,95 +1289,199 @@ function BookChat({
       if (mounted.current) setBusy(false);
     }
   }
+
+  async function sendBlankDraft() {
+    if (!draftText.trim() || busy) return;
+    const sent = draftText;
+    setBusy(true);
+    setError("");
+    let createdSession: Session | null = null;
+    try {
+      createdSession = await request(`/books/${bookId}/sessions`, sessionSchema, {
+        method: "POST",
+        body: {
+          title: "",
+          mode: draftMode,
+          visibility_scope: draftVisibility,
+        },
+      });
+      const run = await request(`/sessions/${createdSession.id}/runs`, runSchema, {
+        method: "POST",
+        body: { text: sent, model_id: draftModelId === "default" ? null : draftModelId },
+      });
+      if (!mounted.current) return;
+      setDraftText("");
+      setDrafting(false);
+      setRunsBySession((old) => ({ ...old, [createdSession!.id]: [run] }));
+      setSessions((old) => [createdSession!, ...old]);
+      setSessionId(createdSession.id);
+      await refresh();
+    } catch (reason) {
+      if (mounted.current) {
+        if (createdSession) {
+          setDrafting(false);
+          setSessionId(createdSession.id);
+          await refresh();
+        }
+        setError(errorText(reason));
+      }
+    } finally {
+      if (mounted.current) setBusy(false);
+    }
+  }
+
+  const effectiveDraftModel = draftModelId === "default" ? defaultModelId : draftModelId;
+  const availableDraftModel = models.some(
+    (model) => model.id === effectiveDraftModel && model.enabled,
+  );
+
+  let usageRow: ReactNode = null;
+  if (selected && selectedRuns && selectedRuns.length > 0) {
+    const totals = selectedRuns.reduce(
+      (acc, run) => ({
+        input: acc.input + run.input_tokens,
+        output: acc.output + run.output_tokens,
+        cache: acc.cache + run.cache_read_tokens,
+      }),
+      { input: 0, output: 0, cache: 0 },
+    );
+    const latestWithTokens = selectedRuns.find((run) => run.input_tokens > 0);
+    const latestModel = latestWithTokens?.model_id
+      ? models.find((item) => item.id === latestWithTokens.model_id)
+      : models.find((item) => item.id === defaultModelId);
+    const contextLimit = latestModel?.context_window ?? null;
+    const latestInput = latestWithTokens?.input_tokens ?? 0;
+    if (totals.input > 0 || totals.output > 0) {
+      const pct =
+        contextLimit && contextLimit > 0
+          ? Math.min(100, (latestInput / contextLimit) * 100).toFixed(1)
+          : null;
+      usageRow = (
+        <div className="chat-header-usage">
+          <span>
+            输入 {formatTokenCount(totals.input)} · 输出 {formatTokenCount(totals.output)}
+            {totals.cache > 0 && ` · 缓存 ${formatTokenCount(totals.cache)}`}
+          </span>
+          {latestInput > 0 && (
+            <span>
+              上下文 {formatTokenCount(latestInput)}
+              {contextLimit ? ` / ${formatTokenCount(contextLimit)} (${pct}%)` : ""}
+            </span>
+          )}
+        </div>
+      );
+    }
+  }
+
   return (
     <>
       {expanded &&
         sidebarTarget &&
         createPortal(
-          <div className="chat-session-list" aria-label="会话列表">
-            {sessions.map((session) => (
-              <div
-                className={`chat-session-row ${session.id === sessionId ? "selected" : ""}`}
-                key={session.id}
-              >
+          <>
+            <div className="directory-section-heading">
+              <h2>对话</h2>
+              <div className="directory-section-actions">
+                <span className="directory-meta">{sessions.length}</span>
                 <Button
                   variant="ghost"
-                  className="chat-session-title"
-                  onClick={() => setSessionId(session.id)}
+                  className="icon-control"
+                  aria-label="新对话"
+                  title="新对话"
+                  onClick={openNewBlankChat}
                 >
-                  {session.title || "未命名会话"}
+                  <SquarePen size={14} />
                 </Button>
-                <div className="chat-session-actions">
-                  <Menu label={`${session.title || "未命名会话"}的操作`} iconOnly>
-                    <MenuItem onSelect={() => editSession("rename", session)}>
-                      <Pencil size={14} />
-                      重命名
-                    </MenuItem>
-                    <MenuSeparator />
-                    <MenuItem danger onSelect={() => editSession("delete", session)}>
-                      <Trash2 size={14} />
-                      删除会话
-                    </MenuItem>
-                  </Menu>
-                </div>
               </div>
-            ))}
-            {loaded && sessions.length === 0 && <p className="muted">暂无会话</p>}
-          </div>,
+            </div>
+            <div className="chat-session-list" aria-label="对话列表">
+              {sessions.map((session) => (
+                <div
+                  className={`chat-session-row ${session.id === sessionId ? "selected" : ""}`}
+                  key={session.id}
+                >
+                  <button
+                    type="button"
+                    className="chat-session-button"
+                    onClick={() => selectExistingSession(session.id)}
+                  >
+                    <span className="chat-session-title">{session.title || "新对话"}</span>
+                    <span className="chat-session-meta">
+                      <span>
+                        {formatRelativeTime(session.updated_at || session.created_at) || "刚才"}
+                      </span>
+                      <span>·</span>
+                      <span>{modeLabels[session.mode]}</span>
+                      {session.visibility_scope === "global" && <Globe size={11} />}
+                    </span>
+                  </button>
+                  <div className="chat-session-actions">
+                    <Menu label={`${session.title || "新对话"}的操作`} iconOnly>
+                      <MenuItem onSelect={() => editSession("rename", session)}>
+                        <Pencil size={14} />
+                        重命名
+                      </MenuItem>
+                      <MenuSeparator />
+                      <MenuItem danger onSelect={() => editSession("delete", session)}>
+                        <Trash2 size={14} />
+                        删除
+                      </MenuItem>
+                    </Menu>
+                  </div>
+                </div>
+              ))}
+              {loaded && sessions.length === 0 && <p className="directory-empty">暂无对话</p>}
+            </div>
+          </>,
           sidebarTarget,
         )}
       <aside
         className={`chat-panel ${expanded ? "chat-panel-expanded" : ""}`}
         aria-label="AI 协作面板"
       >
-        <header className="chat-heading">
-          {expanded && toolbarStart && (
-            <>
-              {toolbarStart}
-              <span className="toolbar-divider" aria-hidden="true" />
-            </>
-          )}
-          <div className="chat-title-menu">
-            {sessions.length ? (
-              <Menu label={selected?.title || "AI 协作"} align="start">
-                {sessions.map((session) => (
-                  <MenuItem key={session.id} onSelect={() => setSessionId(session.id)}>
-                    <Check
-                      size={14}
-                      className={session.id === sessionId ? "opacity-100" : "opacity-0"}
-                    />
-                    {session.title || "未命名会话"}
-                  </MenuItem>
-                ))}
-                {selected && (
-                  <>
-                    <MenuSeparator />
-                    <MenuItem onSelect={() => editSession("rename", selected)}>
-                      <Pencil size={14} />
-                      重命名当前会话
-                    </MenuItem>
-                    <MenuItem danger onSelect={() => editSession("delete", selected)}>
-                      <Trash2 size={14} />
-                      删除当前会话
-                    </MenuItem>
-                  </>
-                )}
-              </Menu>
-            ) : (
-              <span className="chat-empty-title">AI 协作</span>
+        <header className="chat-header">
+          <div className="chat-heading">
+            {expanded && toolbarStart && (
+              <>
+                {toolbarStart}
+                <span className="toolbar-divider" aria-hidden="true" />
+              </>
             )}
+            <div className="chat-title-menu">
+              {sessions.length > 0 ? (
+                <Menu label={selected ? selected.title || "新对话" : "新对话"} align="start">
+                  {sessions.map((session) => (
+                    <MenuItem key={session.id} onSelect={() => selectExistingSession(session.id)}>
+                      <Check
+                        size={14}
+                        className={session.id === sessionId ? "opacity-100" : "opacity-0"}
+                      />
+                      {session.title || "新对话"}
+                    </MenuItem>
+                  ))}
+                  {selected && (
+                    <>
+                      <MenuSeparator />
+                      <MenuItem onSelect={() => editSession("rename", selected)}>
+                        <Pencil size={14} />
+                        重命名对话
+                      </MenuItem>
+                      <MenuItem danger onSelect={() => editSession("delete", selected)}>
+                        <Trash2 size={14} />
+                        删除对话
+                      </MenuItem>
+                    </>
+                  )}
+                </Menu>
+              ) : (
+                <span className="chat-empty-title">新对话</span>
+              )}
+            </div>
+            <Button variant="ghost" aria-label="新对话" title="新对话" onClick={openNewBlankChat}>
+              <SquarePen size={16} />
+            </Button>
           </div>
-          <Button
-            variant="ghost"
-            aria-label="新建会话"
-            title="新建会话"
-            onClick={() => {
-              setTitle("");
-              setEditing("new");
-            }}
-          >
-            <MessageSquarePlus size={18} />
-          </Button>
+          {usageRow}
         </header>
         {connection !== "已连接" && connection !== "连接中" && (
           <p className="chat-connection-error" role="status">
@@ -926,42 +1495,62 @@ function BookChat({
             session={selected}
             models={models}
             defaultModelId={defaultModelId}
+            modelId={draftModelId}
+            onModelChange={setDraftModelId}
+            initialRuns={runsBySession[selected.id]}
+            onRunsChange={(records) =>
+              setRunsBySession((old) => ({ ...old, [selected.id]: records }))
+            }
             onUpdated={(updated) =>
               setSessions((old) => old.map((item) => (item.id === updated.id ? updated : item)))
             }
             onPending={onPending}
+            inputRef={composerInputRef}
           />
         ) : (
-          <EmptyState title={loaded ? "暂无会话" : "正在载入会话…"}>
-            {loaded && (
-              <Button
-                onClick={() => {
-                  setTitle("");
-                  setEditing("new");
-                }}
-              >
-                新建会话
-              </Button>
-            )}
-          </EmptyState>
+          <>
+            <div className="chat-history" aria-label="空白对话">
+              {!loaded ? (
+                <EmptyState title="正在载入对话…" />
+              ) : (
+                <EmptyState title="开始一段新对话">
+                  <p className="muted">输入想法即可直接开始，对话标题会自动生成。</p>
+                </EmptyState>
+              )}
+            </div>
+            <ComposerArea
+              text={draftText}
+              onTextChange={setDraftText}
+              mode={draftMode}
+              onModeChange={setDraftMode}
+              modelId={draftModelId}
+              onModelChange={setDraftModelId}
+              models={models}
+              visibilityScope={draftVisibility}
+              onVisibilityChange={setDraftVisibility}
+              visibilityPermanent={false}
+              running={false}
+              waiting={false}
+              locked={busy || !loaded}
+              busy={busy}
+              availableModel={availableDraftModel}
+              inputRef={composerInputRef}
+              onSend={() => void sendBlankDraft()}
+            />
+          </>
         )}
         <Dialog
-          title={
-            editing === "delete" ? "删除会话" : editing === "rename" ? "重命名会话" : "新建会话"
-          }
+          title={editing === "delete" ? "删除对话" : "重命名对话"}
           open={editing !== null}
           onOpenChange={(open) => {
             if (!open && !busy) setEditing(null);
           }}
         >
           {editing === "delete" ? (
-            <p>
-              删除「{editingSession?.title || "未命名会话"}
-              」及其消息历史？此操作无法撤销。运行或等待回答中的会话须先取消运行。
-            </p>
+            <p>确定删除「{editingSession?.title || "新对话"}」吗？删除后无法恢复。</p>
           ) : (
             <Input
-              label="会话名称"
+              label="对话标题"
               value={title}
               onChange={(event) => setTitle(event.target.value)}
               autoFocus
@@ -976,7 +1565,7 @@ function BookChat({
               variant={editing === "delete" ? "danger" : "primary"}
               disabled={busy}
               onClick={() => {
-                void saveSession();
+                void saveSessionAction();
               }}
             >
               {busy ? "处理中…" : editing === "delete" ? "确认删除" : "保存"}

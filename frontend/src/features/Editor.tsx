@@ -225,7 +225,7 @@ export function Editor({
       {initial?.success && dirty && <div className="draft-restored">已恢复本地草稿</div>}
       {changedElsewhere && (
         <div className="notice">
-          服务端内容已有更新，本地草稿已保留。请先复制需要保留的文字，再重新载入服务端内容。
+          内容已在别处更新，当前未保存的修改已暂存。如需覆盖，请先复制保留后再重新载入。
         </div>
       )}
       <div className="editor-page">
@@ -257,7 +257,7 @@ export function Editor({
         open={reloadOpen}
         onOpenChange={setReloadOpen}
         title="重新载入正文"
-        description="这会放弃当前本地草稿，恢复为服务端已保存的内容。"
+        description="这会放弃当前未保存的修改，恢复到上次保存的版本。"
       >
         <div className="row end">
           <Button onClick={() => setReloadOpen(false)}>继续编辑</Button>

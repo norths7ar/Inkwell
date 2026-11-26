@@ -65,6 +65,8 @@ export const sessionSchema = z.object({
   title: z.string(),
   mode: modeSchema,
   visibility_scope: visibilitySchema,
+  created_at: z.string().default(""),
+  updated_at: z.string().default(""),
 });
 export const errorSchema = z.object({
   category: z.string(),
@@ -82,6 +84,10 @@ export const runSchema = z.object({
   pending_question_json: z.string().nullable(),
   error_message: z.string().nullable(),
   error: errorSchema.nullable(),
+  input_tokens: z.number().default(0),
+  output_tokens: z.number().default(0),
+  cache_read_tokens: z.number().default(0),
+  cache_write_tokens: z.number().default(0),
   started_at: z.string(),
 });
 export const messageSchema = z.object({

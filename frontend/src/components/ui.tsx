@@ -2,8 +2,9 @@ import {
   useId,
   type ButtonHTMLAttributes,
   type InputHTMLAttributes,
-  type TextareaHTMLAttributes,
   type ReactNode,
+  type Ref,
+  type TextareaHTMLAttributes,
 } from "react";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import * as SelectPrimitive from "@radix-ui/react-select";
@@ -35,13 +36,17 @@ export function Input({
 export function Textarea({
   label,
   className = "",
+  ref,
   ...props
-}: TextareaHTMLAttributes<HTMLTextAreaElement> & { label?: string }) {
+}: TextareaHTMLAttributes<HTMLTextAreaElement> & {
+  label?: string;
+  ref?: Ref<HTMLTextAreaElement>;
+}) {
   const id = useId();
   return (
     <label className={`field ${className}`} htmlFor={id}>
       {label && <span>{label}</span>}
-      <textarea id={id} {...props} />
+      <textarea ref={ref} id={id} {...props} />
     </label>
   );
 }

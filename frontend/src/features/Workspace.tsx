@@ -76,6 +76,15 @@ type WorkspaceData = {
 };
 
 const emptyData: WorkspaceData = { volumes: [], chapters: [], entries: [], changes: [] };
+const SIDEBAR_WIDTH_KEY = "inkwell:sidebar-width";
+const DEFAULT_SIDEBAR_WIDTH = 240;
+const MIN_SIDEBAR_WIDTH = 200;
+const MAX_SIDEBAR_WIDTH = 420;
+
+function clampSidebarWidth(value: number): number {
+  if (!Number.isFinite(value)) return DEFAULT_SIDEBAR_WIDTH;
+  return Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, Math.round(value)));
+}
 const entryKinds: readonly { value: EntryKind; label: string }[] = [
   { value: "character", label: "人物" },
   { value: "world", label: "世界" },
@@ -125,6 +134,15 @@ export function Workspace({
   const [busy, setBusy] = useState(false);
   const [selected, setSelected] = useState<Selection | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem(SIDEBAR_WIDTH_KEY);
+      return saved ? clampSidebarWidth(Number(saved)) : DEFAULT_SIDEBAR_WIDTH;
+    } catch {
+      return DEFAULT_SIDEBAR_WIDTH;
+    }
+  });
+  const [resizing, setResizing] = useState(false);
   const [companionOpen, setCompanionOpen] = useState(true);
   const [sessionSidebar, setSessionSidebar] = useState<HTMLDivElement | null>(null);
   const [focusPending, setFocusPending] = useState<string | null>(null);
@@ -157,7 +175,7 @@ export function Workspace({
         event.type === "content_changed" &&
         event.book_id === bookId &&
         (event.resource
-          ? !["session", "message", "run"].includes(event.resource)
+          ? !["session", "session_deleted", "message", "run"].includes(event.resource)
           : !event.session_id || Boolean(event.run_id)))
     )
       refresh();
@@ -601,7 +619,7 @@ export function Workspace({
     if (selected.kind === "chapter") {
       const latest = await request(`/chapters/${selected.id}`, chapterSchema);
       if (latest.content !== baseline.content || latest.title !== baseline.title)
-        throw new ApiError(409, "章节已在其他位置更新，本地草稿已保留，请先对照再重新载入。");
+        throw new ApiError(409, "章节已在别处更新，未保存的修改已暂存，请对照后再重新载入。");
       const updated = await request(`/chapters/${selected.id}`, chapterSchema, {
         method: "PATCH",
         body: value,
@@ -613,7 +631,7 @@ export function Workspace({
     } else {
       const latest = await request(`/entries/${selected.id}`, entrySchema);
       if (latest.content !== baseline.content || latest.title !== baseline.title)
-        throw new ApiError(409, "设定已在其他位置更新，本地草稿已保留，请先对照再重新载入。");
+        throw new ApiError(409, "设定已在别处更新，未保存的修改已暂存，请对照后再重新载入。");
       const updated = await request(`/entries/${selected.id}`, entrySchema, {
         method: "PATCH",
         body: value,
@@ -915,8 +933,51 @@ export function Workspace({
     </Button>
   );
 
+  const updateSidebarWidth = useCallback((nextWidth: number) => {
+    const clamped = clampSidebarWidth(nextWidth);
+    setSidebarWidth(clamped);
+    try {
+      localStorage.setItem(SIDEBAR_WIDTH_KEY, String(clamped));
+    } catch {
+      /* Optional preference. */
+    }
+    return clamped;
+  }, []);
+
+  const startSidebarResize = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      if (sidebarClosed) return;
+      event.preventDefault();
+      const startX = event.clientX;
+      const startWidth = sidebarWidth;
+      let latestWidth = startWidth;
+      setResizing(true);
+
+      const onMove = (moveEvent: PointerEvent) => {
+        latestWidth = clampSidebarWidth(startWidth + (moveEvent.clientX - startX));
+        setSidebarWidth(latestWidth);
+      };
+      const onUp = () => {
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+        setResizing(false);
+        updateSidebarWidth(latestWidth);
+      };
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
+    },
+    [sidebarClosed, sidebarWidth, updateSidebarWidth],
+  );
+
   return (
-    <div className={`app-shell ${sidebarClosed ? "sidebar-collapsed" : ""}`}>
+    <div
+      className={`app-shell ${sidebarClosed ? "sidebar-collapsed" : ""} ${resizing ? "is-resizing" : ""}`}
+      style={
+        !sidebarClosed
+          ? { gridTemplateColumns: `48px ${sidebarWidth}px minmax(0, 1fr)` }
+          : undefined
+      }
+    >
       <nav className="activity-rail" aria-label="主导航">
         <Button
           variant="ghost"
@@ -1343,6 +1404,15 @@ export function Workspace({
             </div>
           </div>
         )}
+        <div
+          className="sidebar-resize-handle"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="调整侧边栏宽度"
+          title="拖动调整宽度（双击恢复默认）"
+          onPointerDown={startSidebarResize}
+          onDoubleClick={() => updateSidebarWidth(DEFAULT_SIDEBAR_WIDTH)}
+        />
       </aside>
 
       <div

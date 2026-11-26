@@ -105,7 +105,12 @@ def create_router(runtime: ApiRuntime) -> APIRouter:
             else UNSET,
         )
         runtime.events.publish(
-            "content_changed", {"book_id": session.book_id, "session_id": session.id}
+            "content_changed",
+            {
+                "book_id": session.book_id,
+                "session_id": session.id,
+                "resource": "session_deleted",
+            },
         )
         return session
 
@@ -115,7 +120,12 @@ def create_router(runtime: ApiRuntime) -> APIRouter:
         runtime.ensure_session_idle(session_id)
         sessions.delete_session(runtime.conn, session_id)
         runtime.events.publish(
-            "content_changed", {"book_id": session.book_id, "session_id": session.id}
+            "content_changed",
+            {
+                "book_id": session.book_id,
+                "session_id": session.id,
+                "resource": "session_deleted",
+            },
         )
         return Response(status_code=204)
 
