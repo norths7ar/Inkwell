@@ -22,6 +22,17 @@ class RunStartedEvent:
 class ReasoningDeltaEvent:
     run_id: str
     delta: str
+    iteration: int = 0
+    block_index: int = 0
+    duration_ms: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ReasoningCompletedEvent:
+    run_id: str
+    iteration: int
+    block_index: int
+    duration_ms: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +91,7 @@ class RunFinishedEvent:
 type AgentEvent = (
     RunStartedEvent
     | ReasoningDeltaEvent
+    | ReasoningCompletedEvent
     | TextDeltaEvent
     | AttemptResetEvent
     | ToolStartedEvent

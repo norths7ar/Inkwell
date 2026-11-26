@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from backend.api import content, sessions, settings
+from backend.api import content, sessions, settings, transfers
 from backend.api.errors import validation_details
 from backend.api.events import EventBus
 from backend.api.runtime import ApiRuntime
@@ -109,7 +109,7 @@ def create_app(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    for module in (content, settings, sessions):
+    for module in (transfers, content, settings, sessions):
         app.include_router(module.create_router(runtime), prefix="/api")
     dist = (
         static_dir

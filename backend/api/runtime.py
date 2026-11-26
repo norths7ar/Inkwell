@@ -12,6 +12,7 @@ from backend.agent import events as agent_events
 from backend.agent.loop import AgentRunner
 from backend.agent.serialization import serialize_blocks
 from backend.api.events import EventBus
+from backend.api.references import EntityReference, resolve_references
 from backend.config import AppConfig
 from backend.crypto import create_cipher
 from backend.errors import exception_error
@@ -38,6 +39,7 @@ class ActiveRun:
     steer: asyncio.Queue[str] = field(default_factory=asyncio.Queue)
     task: asyncio.Task[None] | None = None
     auto_title: tuple[str, str] | None = None
+    extra_snippets: tuple[str, ...] = ()
 
 
 class ApiRuntime:
@@ -51,6 +53,7 @@ class ApiRuntime:
         self.runner = AgentRunner(self.db, llm)
         self.active: dict[str, ActiveRun] = {}
         self.background_tasks: set[asyncio.Task[None]] = set()
+        self.maintenance_sessions: set[str] = set()
 
     def open(self) -> None:
         self.config.ensure_data_dirs()
@@ -92,6 +95,11 @@ class ApiRuntime:
         )
 
     def ensure_book_idle(self, book_id: str) -> None:
+        if any(
+            session.id in self.maintenance_sessions
+            for session in sessions.list_sessions(self.conn, book_id)
+        ):
+            raise HTTPException(409, "Book has a session maintenance operation")
         if self.conn.execute(
             "SELECT 1 FROM runs WHERE book_id=? AND status IN ('running','waiting_user')",
             (book_id,),
@@ -99,6 +107,8 @@ class ApiRuntime:
             raise HTTPException(409, "Book has an active or waiting run")
 
     def ensure_session_idle(self, session_id: str) -> None:
+        if session_id in self.maintenance_sessions:
+            raise HTTPException(409, "Session has a maintenance operation")
         if any(item.run.session_id == session_id for item in self.active.values()) or any(
             run.status in (RunStatus.RUNNING, RunStatus.WAITING_USER)
             for run in sessions.list_runs(self.conn, session_id)
@@ -188,7 +198,14 @@ class ApiRuntime:
             return
 
     def start(
-        self, session_id: str, text: str, record_id: str | None, *, answer_to: str | None = None
+        self,
+        session_id: str,
+        text: str,
+        record_id: str | None,
+        *,
+        answer_to: str | None = None,
+        reasoning_effort: str | None = None,
+        references: list[EntityReference] | None = None,
     ) -> Run:
         session = sessions.get_session(self.conn, session_id)
         if session is None:
@@ -202,6 +219,16 @@ class ApiRuntime:
                 raise HTTPException(409, "Run is not waiting for an answer")
             if answer_to in self.active:
                 raise HTTPException(409, "Run is still finishing; retry the answer")
+            if waiting.session_id != session_id:
+                raise HTTPException(409, "Run belongs to another session")
+            if reasoning_effort is None:
+                reasoning_effort = waiting.reasoning_effort
+            if references is None:
+                references = TypeAdapter(list[EntityReference]).validate_json(
+                    waiting.references_json
+                )
+        references = references or []
+        snippets = resolve_references(self.conn, session, references)
         fallback_title: str | None = None
         if answer_to is None and not session.title.strip():
             fallback_title = self._fallback_session_title(text)
@@ -211,7 +238,12 @@ class ApiRuntime:
             if answer_to is not None:
                 sessions.finish_run(self.conn, answer_to, status=RunStatus.COMPLETED)
             run = sessions.create_run(
-                self.conn, session_id=session_id, book_id=session.book_id, model_id=model.id
+                self.conn,
+                session_id=session_id,
+                book_id=session.book_id,
+                model_id=model.id,
+                reasoning_effort=reasoning_effort,
+                references_json=TypeAdapter(list[EntityReference]).dump_json(references).decode(),
             )
             sessions.append_message(
                 self.conn,
@@ -224,6 +256,7 @@ class ApiRuntime:
         active = ActiveRun(
             run,
             auto_title=(fallback_title, text) if fallback_title is not None else None,
+            extra_snippets=snippets,
         )
         self.active[run.id] = active
         active.task = asyncio.create_task(self._execute(active, model, endpoint))
@@ -234,6 +267,7 @@ class ApiRuntime:
             agent_events.RunStartedEvent: "run_started",
             agent_events.TextDeltaEvent: "text_delta",
             agent_events.ReasoningDeltaEvent: "reasoning_delta",
+            agent_events.ReasoningCompletedEvent: "reasoning_completed",
             agent_events.AttemptResetEvent: "attempt_reset",
             agent_events.ToolStartedEvent: "tool_start",
             agent_events.ToolFinishedEvent: "tool_result",
@@ -243,6 +277,9 @@ class ApiRuntime:
         }
         payload = TypeAdapter(dict[str, JsonValue]).validate_json(json.dumps(asdict(event)))
         payload.update(book_id=run.book_id, session_id=run.session_id, run_id=run.id)
+        if isinstance(event, (agent_events.RunFinishedEvent, agent_events.WaitingUserEvent)):
+            current = sessions.get_run(self.conn, run.id)
+            payload["reasoning_duration_ms"] = current.reasoning_duration_ms if current else 0
         self.events.publish(names[type(event)], payload)
         if isinstance(
             event, (agent_events.PendingChangeCreatedEvent, agent_events.RunFinishedEvent)
@@ -267,6 +304,8 @@ class ApiRuntime:
                 if model.protocol_override
                 else None,
                 max_output_tokens=model.max_output_tokens,
+                reasoning_effort=run.reasoning_effort,
+                extra_snippets=active.extra_snippets,
                 sink=lambda event: self._emit(event, run),
             )
         except asyncio.CancelledError:

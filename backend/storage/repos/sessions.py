@@ -30,6 +30,7 @@ def _session_from_row(row: sqlite3.Row) -> Session:
         visibility_scope=Visibility(str(row["visibility_scope"])),
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
+        pinned=bool(row["pinned"]),
     )
 
 
@@ -57,6 +58,11 @@ def _run_from_row(row: sqlite3.Row) -> Run:
             if row["error_json"] is not None
             else None
         ),
+        reasoning_effort=str(row["reasoning_effort"])
+        if row["reasoning_effort"] is not None
+        else None,
+        references_json=str(row["references_json"]),
+        reasoning_duration_ms=int(row["reasoning_duration_ms"]),
     )
 
 
@@ -82,16 +88,26 @@ def create_session(
     mode: SessionMode = SessionMode.DISCUSS,
     visibility_scope: Visibility = Visibility.LOCAL,
     session_id: str | None = None,
+    pinned: bool = False,
 ) -> Session:
     now = utc_now()
     resolved_id = session_id or new_id()
     with ensure_transaction(conn):
         conn.execute(
             """
-            INSERT INTO sessions (id, book_id, title, mode, visibility_scope, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO sessions (id, book_id, title, mode, visibility_scope, created_at, updated_at, pinned)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (resolved_id, book_id, title, mode.value, visibility_scope.value, now, now),
+            (
+                resolved_id,
+                book_id,
+                title,
+                mode.value,
+                visibility_scope.value,
+                now,
+                now,
+                int(pinned),
+            ),
         )
     session = get_session(conn, resolved_id)
     if session is None:
@@ -106,7 +122,7 @@ def get_session(conn: sqlite3.Connection, session_id: str) -> Session | None:
 
 def list_sessions(conn: sqlite3.Connection, book_id: str) -> list[Session]:
     rows = conn.execute(
-        "SELECT * FROM sessions WHERE book_id = ? ORDER BY updated_at DESC, id DESC",
+        "SELECT * FROM sessions WHERE book_id = ? ORDER BY pinned DESC, updated_at DESC, id DESC",
         (book_id,),
     ).fetchall()
     return [_session_from_row(row) for row in rows]
@@ -119,6 +135,7 @@ def update_session(
     title: str | Unset = UNSET,
     mode: SessionMode | Unset = UNSET,
     visibility_scope: Visibility | Unset = UNSET,
+    pinned: bool | Unset = UNSET,
 ) -> Session:
     existing = get_session(conn, session_id)
     if existing is None:
@@ -128,7 +145,7 @@ def update_session(
         conn.execute(
             """
             UPDATE sessions
-            SET title = ?, mode = ?, visibility_scope = ?, updated_at = ?
+            SET title = ?, mode = ?, visibility_scope = ?, updated_at = ?, pinned = ?
             WHERE id = ?
             """,
             (
@@ -140,6 +157,7 @@ def update_session(
                     else visibility_scope
                 ).value,
                 now,
+                int(existing.pinned if isinstance(pinned, Unset) else pinned),
                 session_id,
             ),
         )
@@ -162,6 +180,8 @@ def create_run(
     book_id: str,
     model_id: str | None = None,
     run_id: str | None = None,
+    reasoning_effort: str | None = None,
+    references_json: str = "[]",
 ) -> Run:
     now = utc_now()
     resolved_id = run_id or new_id()
@@ -169,11 +189,20 @@ def create_run(
         conn.execute(
             """
             INSERT INTO runs (
-                id, session_id, book_id, status, model_id, started_at
+                id, session_id, book_id, status, model_id, started_at, reasoning_effort, references_json
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (resolved_id, session_id, book_id, RunStatus.RUNNING.value, model_id, now),
+            (
+                resolved_id,
+                session_id,
+                book_id,
+                RunStatus.RUNNING.value,
+                model_id,
+                now,
+                reasoning_effort,
+                references_json,
+            ),
         )
     run = get_run(conn, resolved_id)
     if run is None:

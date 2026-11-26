@@ -6,12 +6,14 @@ import asyncio
 import json
 from contextlib import closing
 from dataclasses import dataclass, field
+from time import monotonic_ns
 
 from backend.agent.context import build_context
 from backend.agent.events import (
     AttemptResetEvent,
     EventSink,
     PendingChangeCreatedEvent,
+    ReasoningCompletedEvent,
     RunFinishedEvent,
     RunStartedEvent,
     ToolFinishedEvent,
@@ -109,6 +111,7 @@ class AgentRunner:
         run_id: str,
         sink: EventSink | None,
         cancel_event: asyncio.Event | None,
+        iteration: int = 0,
     ) -> GenerateResponse:
         blocks: list[ContentBlock] = []
         reasoning_parts: list[str] = []
@@ -117,55 +120,86 @@ class AgentRunner:
         tool_calls: dict[int, _ToolAcc] = {}
         usage = TokenUsage()
         finish_reason: str | None = None
+        reasoning_started: int | None = None
 
-        def flush_reasoning() -> None:
+        async def flush_reasoning() -> None:
+            nonlocal reasoning_started
             if reasoning_parts or signature_parts:
+                duration = (
+                    max(0, (monotonic_ns() - reasoning_started) // 1_000_000)
+                    if reasoning_started is not None
+                    else 0
+                )
+                block_index = len(blocks)
                 blocks.append(
                     ReasoningBlock(
                         text="".join(reasoning_parts),
                         signature="".join(signature_parts) if signature_parts else None,
+                        duration_ms=duration,
                     )
                 )
                 reasoning_parts.clear()
                 signature_parts.clear()
+                reasoning_started = None
+                with self.db.transaction() as conn:
+                    conn.execute(
+                        "UPDATE runs SET reasoning_duration_ms=reasoning_duration_ms+? WHERE id=?",
+                        (duration, run_id),
+                    )
+                await emit_event(
+                    sink, ReasoningCompletedEvent(run_id, iteration, block_index, duration)
+                )
 
         def flush_text() -> None:
             if text_parts:
                 blocks.append(TextBlock("".join(text_parts)))
                 text_parts.clear()
 
-        async for event in self.llm_client.stream(endpoint, request):
-            if cancel_event is not None and cancel_event.is_set():
-                raise _TurnCancelledError
+        try:
+            async for event in self.llm_client.stream(endpoint, request):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise _TurnCancelledError
 
-            if isinstance(event, ReasoningDeltaEvent):
-                flush_text()
-                if event.delta:
-                    reasoning_parts.append(event.delta)
-                    await emit_event(sink, AgentReasoningDeltaEvent(run_id, event.delta))
-                if event.signature_delta:
-                    signature_parts.append(event.signature_delta)
-            elif isinstance(event, TextDeltaEvent):
-                flush_reasoning()
-                if event.delta:
-                    text_parts.append(event.delta)
-                    await emit_event(sink, AgentTextDeltaEvent(run_id, event.delta))
-            elif isinstance(event, ToolCallDeltaEvent):
-                flush_reasoning()
-                flush_text()
-                acc = tool_calls.setdefault(event.index, _ToolAcc())
-                if event.call_id and not acc.call_id:
-                    acc.call_id = event.call_id
-                if event.name and not acc.name:
-                    acc.name = event.name
-                if event.arguments_delta:
-                    acc.arguments_parts.append(event.arguments_delta)
-            elif isinstance(event, UsageEvent):
-                usage = event.usage
-            elif isinstance(event, DoneEvent):
-                finish_reason = event.finish_reason
-
-        flush_reasoning()
+                if isinstance(event, ReasoningDeltaEvent):
+                    flush_text()
+                    if reasoning_started is None:
+                        reasoning_started = monotonic_ns()
+                    if event.delta:
+                        reasoning_parts.append(event.delta)
+                        await emit_event(
+                            sink,
+                            AgentReasoningDeltaEvent(
+                                run_id,
+                                event.delta,
+                                iteration,
+                                len(blocks),
+                                max(0, (monotonic_ns() - reasoning_started) // 1_000_000),
+                            ),
+                        )
+                    if event.signature_delta:
+                        signature_parts.append(event.signature_delta)
+                elif isinstance(event, TextDeltaEvent):
+                    await flush_reasoning()
+                    if event.delta:
+                        text_parts.append(event.delta)
+                        await emit_event(sink, AgentTextDeltaEvent(run_id, event.delta))
+                elif isinstance(event, ToolCallDeltaEvent):
+                    await flush_reasoning()
+                    flush_text()
+                    acc = tool_calls.setdefault(event.index, _ToolAcc())
+                    if event.call_id and not acc.call_id:
+                        acc.call_id = event.call_id
+                    if event.name and not acc.name:
+                        acc.name = event.name
+                    if event.arguments_delta:
+                        acc.arguments_parts.append(event.arguments_delta)
+                elif isinstance(event, UsageEvent):
+                    usage = event.usage
+                elif isinstance(event, DoneEvent):
+                    finish_reason = event.finish_reason
+        finally:
+            # Include observed reasoning time on interrupted/retried streams as well.
+            await flush_reasoning()
         flush_text()
         for idx in sorted(tool_calls):
             acc = tool_calls[idx]
@@ -207,6 +241,7 @@ class AgentRunner:
         run_id: str,
         sink: EventSink | None,
         cancel_event: asyncio.Event | None,
+        iteration: int = 0,
     ) -> GenerateResponse:
         for attempt in range(self.max_llm_retries + 1):
             try:
@@ -216,6 +251,7 @@ class AgentRunner:
                     run_id=run_id,
                     sink=sink,
                     cancel_event=cancel_event,
+                    iteration=iteration,
                 )
             except LLMError as exc:
                 if not exc.retryable or attempt >= self.max_llm_retries:
@@ -446,6 +482,7 @@ class AgentRunner:
                     book_id=book.id,
                     model_id=model_id,
                     run_id=run_id,
+                    reasoning_effort=reasoning_effort,
                 )
 
         await emit_event(sink, RunStartedEvent(run.id, session.id, book.id))
@@ -509,6 +546,7 @@ class AgentRunner:
                     run_id=run.id,
                     sink=sink,
                     cancel_event=cancel_event,
+                    iteration=_iteration,
                 )
 
                 total_in += response.usage.input_tokens

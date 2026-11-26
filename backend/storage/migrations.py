@@ -6,7 +6,7 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _V1_STATEMENTS: tuple[str, ...] = (
     """
@@ -215,6 +215,26 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (1, _V1_STATEMENTS),
     (2, ("ALTER TABLE runs ADD COLUMN error_json TEXT",)),
     (3, ("ALTER TABLE books ADD COLUMN cover_path TEXT NOT NULL DEFAULT ''",)),
+    (
+        4,
+        (
+            "ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0 CHECK(pinned IN (0, 1))",
+            "ALTER TABLE runs ADD COLUMN reasoning_effort TEXT",
+            "ALTER TABLE runs ADD COLUMN references_json TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE runs ADD COLUMN reasoning_duration_ms INTEGER NOT NULL DEFAULT 0",
+            """CREATE TABLE compactions (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            through_seq INTEGER NOT NULL,
+            summary_json TEXT NOT NULL,
+            model_id TEXT,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )""",
+            "CREATE INDEX idx_compactions_session_seq ON compactions(session_id, through_seq)",
+        ),
+    ),
 )
 
 

@@ -32,6 +32,8 @@ def _encode_block(block: ContentBlock) -> JsonObject:
         obj: JsonObject = {"type": "reasoning", "text": block.text}
         if block.signature is not None:
             obj["signature"] = block.signature
+        if block.duration_ms is not None:
+            obj["duration_ms"] = block.duration_ms
         return obj
     if isinstance(block, ToolCallBlock):
         return {
@@ -67,9 +69,13 @@ def _decode_block(obj: JsonObject) -> ContentBlock | None:
     if kind == "text":
         return TextBlock(text=get_str(obj, "text") or "")
     if kind == "reasoning":
+        duration = obj.get("duration_ms")
         return ReasoningBlock(
             text=get_str(obj, "text") or "",
             signature=get_str(obj, "signature"),
+            duration_ms=duration
+            if isinstance(duration, int) and not isinstance(duration, bool)
+            else None,
         )
     if kind == "tool_call":
         return ToolCallBlock(

@@ -10,6 +10,8 @@ from pydantic import BaseModel
 from backend.storage.ids import new_id, utc_now
 from backend.storage.migrations import ensure_transaction
 from backend.storage.models import (
+    Chapter,
+    Entry,
     EntryKind,
     PendingAction,
     PendingChange,
@@ -27,9 +29,50 @@ from backend.storage.repos.content import (
     delete_entry,
     get_chapter,
     get_entry,
+    get_volume,
     update_chapter,
     update_entry,
 )
+
+
+def content_snapshot(item: Chapter | Entry, *, deleted: bool = False) -> str:
+    """Metadata accompanying an exact content revision, including ordering."""
+    snapshot: dict[str, str | int | bool | None]
+    if isinstance(item, Chapter):
+        snapshot = {
+            "volume_id": item.volume_id,
+            "summary": item.summary,
+            "sort_order": item.sort_order,
+        }
+    else:
+        snapshot = {
+            "kind": item.kind.value,
+            "category": item.category,
+            "visibility": item.visibility.value,
+            "meta_json": item.meta_json,
+            "sort_order": item.sort_order,
+        }
+    if deleted:
+        snapshot["deleted"] = True
+    return json.dumps(snapshot)
+
+
+def record_content_revision(
+    conn: sqlite3.Connection,
+    item: Chapter | Entry,
+    *,
+    source: RevisionSource = RevisionSource.USER,
+) -> Revision:
+    return create_revision(
+        conn,
+        book_id=item.book_id,
+        target_type=TargetType.CHAPTER if isinstance(item, Chapter) else TargetType.ENTRY,
+        target_id=item.id,
+        source=source,
+        title=item.title,
+        content=item.content,
+        snapshot_json=content_snapshot(item),
+    )
 
 
 class _ChapterChangePayload(BaseModel):
@@ -265,7 +308,7 @@ def _apply_chapter_change(
             summary=payload.summary or "",
             sort_order=payload.sort_order if payload.sort_order is not None else 0,
         )
-        snapshot = json.dumps({"volume_id": chapter.volume_id, "summary": chapter.summary})
+        snapshot = content_snapshot(chapter)
         return chapter.id, chapter.title, chapter.content, snapshot
 
     if change.target_id is None:
@@ -284,13 +327,11 @@ def _apply_chapter_change(
             summary=payload.summary if payload.summary is not None else UNSET,
             sort_order=payload.sort_order if payload.sort_order is not None else UNSET,
         )
-        snapshot = json.dumps({"volume_id": chapter.volume_id, "summary": chapter.summary})
+        snapshot = content_snapshot(chapter)
         return chapter.id, chapter.title, chapter.content, snapshot
 
     delete_chapter(conn, existing.id)
-    snapshot = json.dumps(
-        {"deleted": True, "volume_id": existing.volume_id, "summary": existing.summary}
-    )
+    snapshot = content_snapshot(existing, deleted=True)
     return existing.id, existing.title, existing.content, snapshot
 
 
@@ -311,14 +352,7 @@ def _apply_entry_change(
             meta_json=payload.meta_json or "{}",
             sort_order=payload.sort_order if payload.sort_order is not None else 0,
         )
-        snapshot = json.dumps(
-            {
-                "kind": entry.kind.value,
-                "category": entry.category,
-                "visibility": entry.visibility.value,
-                "meta_json": entry.meta_json,
-            }
-        )
+        snapshot = content_snapshot(entry)
         return entry.id, entry.title, entry.content, snapshot
 
     if change.target_id is None:
@@ -339,26 +373,11 @@ def _apply_entry_change(
             meta_json=payload.meta_json if payload.meta_json is not None else UNSET,
             sort_order=payload.sort_order if payload.sort_order is not None else UNSET,
         )
-        snapshot = json.dumps(
-            {
-                "kind": entry.kind.value,
-                "category": entry.category,
-                "visibility": entry.visibility.value,
-                "meta_json": entry.meta_json,
-            }
-        )
+        snapshot = content_snapshot(entry)
         return entry.id, entry.title, entry.content, snapshot
 
     delete_entry(conn, existing.id)
-    snapshot = json.dumps(
-        {
-            "deleted": True,
-            "kind": existing.kind.value,
-            "category": existing.category,
-            "visibility": existing.visibility.value,
-            "meta_json": existing.meta_json,
-        }
-    )
+    snapshot = content_snapshot(existing, deleted=True)
     return existing.id, existing.title, existing.content, snapshot
 
 
@@ -400,3 +419,108 @@ def apply_pending_change(conn: sqlite3.Connection, change_id: str) -> PendingCha
     if updated is None:
         raise LookupError(f"Pending change not found after apply: {change_id}")
     return updated
+
+
+def restore_revision(
+    conn: sqlite3.Connection,
+    revision_id: str,
+    *,
+    target_type: TargetType,
+    target_id: str,
+) -> tuple[Chapter | Entry, Revision]:
+    """Restore content and metadata atomically, retaining the state being replaced."""
+    with ensure_transaction(conn):
+        revision = get_revision(conn, revision_id)
+        if revision is None:
+            raise LookupError("Revision not found")
+        if revision.target_type != target_type or revision.target_id != target_id:
+            raise ValueError("Revision belongs to a different target")
+        existing = (
+            get_chapter(conn, target_id)
+            if target_type == TargetType.CHAPTER
+            else get_entry(conn, target_id)
+        )
+        if existing is not None and existing.book_id != revision.book_id:
+            raise ValueError("Revision belongs to a different book")
+        if existing is not None:
+            history = list_revisions(
+                conn, revision.book_id, target_type=target_type, target_id=target_id
+            )
+            if not any(
+                item.title == existing.title
+                and item.content == existing.content
+                and item.snapshot_json == content_snapshot(existing)
+                for item in history
+            ):
+                record_content_revision(conn, existing)
+        restored: Chapter | Entry
+        if target_type == TargetType.CHAPTER:
+            chapter_payload = _ChapterChangePayload.model_validate_json(revision.snapshot_json)
+            volume_id = chapter_payload.volume_id
+            if volume_id is not None:
+                volume = get_volume(conn, volume_id)
+                if volume is None or volume.book_id != revision.book_id:
+                    raise ValueError("Revision volume is no longer available in this book")
+            if existing is None:
+                restored = create_chapter(
+                    conn,
+                    book_id=revision.book_id,
+                    chapter_id=target_id,
+                    title=revision.title,
+                    content=revision.content,
+                    volume_id=volume_id,
+                    summary=chapter_payload.summary or "",
+                    sort_order=chapter_payload.sort_order or 0,
+                )
+            else:
+                restored = update_chapter(
+                    conn,
+                    target_id,
+                    title=revision.title,
+                    content=revision.content,
+                    volume_id=volume_id
+                    if "volume_id" in chapter_payload.model_fields_set
+                    else UNSET,
+                    summary=chapter_payload.summary
+                    if chapter_payload.summary is not None
+                    else UNSET,
+                    sort_order=chapter_payload.sort_order
+                    if chapter_payload.sort_order is not None
+                    else UNSET,
+                )
+        else:
+            entry_payload = _EntryChangePayload.model_validate_json(revision.snapshot_json)
+            if existing is None:
+                restored = create_entry(
+                    conn,
+                    book_id=revision.book_id,
+                    entry_id=target_id,
+                    kind=entry_payload.kind or EntryKind.NOTE,
+                    title=revision.title,
+                    content=revision.content,
+                    category=entry_payload.category or "",
+                    visibility=entry_payload.visibility or Visibility.LOCAL,
+                    meta_json=entry_payload.meta_json or "{}",
+                    sort_order=entry_payload.sort_order or 0,
+                )
+            else:
+                restored = update_entry(
+                    conn,
+                    target_id,
+                    title=revision.title,
+                    content=revision.content,
+                    kind=entry_payload.kind if entry_payload.kind is not None else UNSET,
+                    category=entry_payload.category
+                    if entry_payload.category is not None
+                    else UNSET,
+                    visibility=entry_payload.visibility
+                    if entry_payload.visibility is not None
+                    else UNSET,
+                    meta_json=entry_payload.meta_json
+                    if entry_payload.meta_json is not None
+                    else UNSET,
+                    sort_order=entry_payload.sort_order
+                    if entry_payload.sort_order is not None
+                    else UNSET,
+                )
+        return restored, record_content_revision(conn, restored, source=RevisionSource.RESTORE)

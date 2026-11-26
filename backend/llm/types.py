@@ -37,6 +37,7 @@ class TextBlock:
 class ReasoningBlock:
     text: str
     signature: str | None = None
+    duration_ms: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

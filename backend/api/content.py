@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
@@ -10,6 +9,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter
 
 from backend.api.runtime import ApiRuntime
+from backend.storage.ids import new_id
 from backend.storage.migrations import ensure_transaction
 from backend.storage.models import (
     Book,
@@ -20,7 +20,6 @@ from backend.storage.models import (
     PendingChange,
     PendingStatus,
     Revision,
-    RevisionSource,
     SearchHit,
     TargetType,
     Visibility,
@@ -63,6 +62,24 @@ class EntryInput(Input):
     visibility: Visibility = Visibility.LOCAL
     meta_json: str = "{}"
     sort_order: int = 0
+
+
+class BatchChangesInput(Input):
+    change_ids: list[str] | None = Field(default=None, min_length=1, max_length=1000)
+
+
+class BatchChangesResult(BaseModel):
+    changes: list[PendingChange]
+    count: int
+
+
+class RestoreInput(Input):
+    revision_id: str = Field(min_length=1)
+
+
+class RestoreResult(BaseModel):
+    target: Chapter | Entry
+    revision: Revision
 
 
 def supplied[T](body: BaseModel, name: str, value: T) -> T | Unset:
@@ -113,27 +130,7 @@ def create_router(runtime: ApiRuntime) -> APIRouter:
             raise HTTPException(409, "Volume belongs to another book")
 
     def revision(item: Chapter | Entry) -> None:
-        snapshot = (
-            {"volume_id": item.volume_id, "summary": item.summary, "sort_order": item.sort_order}
-            if isinstance(item, Chapter)
-            else {
-                "kind": item.kind,
-                "category": item.category,
-                "visibility": item.visibility,
-                "meta_json": item.meta_json,
-                "sort_order": item.sort_order,
-            }
-        )
-        changes.create_revision(
-            runtime.conn,
-            book_id=item.book_id,
-            target_type=(TargetType.CHAPTER if isinstance(item, Chapter) else TargetType.ENTRY),
-            target_id=item.id,
-            source=RevisionSource.USER,
-            title=item.title,
-            content=item.content,
-            snapshot_json=json.dumps(snapshot),
-        )
+        changes.record_content_revision(runtime.conn, item)
 
     @router.get("/books")
     async def books() -> list[Book]:
@@ -195,26 +192,32 @@ def create_router(runtime: ApiRuntime) -> APIRouter:
         ext = _COVER_MIME_TO_EXT.get(media_type)
         if ext is None:
             raise HTTPException(415, "Cover must be JPEG, PNG, or WebP")
-        raw = await request.body()
+        raw = bytearray()
+        async for chunk in request.stream():
+            if len(raw) + len(chunk) > _MAX_COVER_BYTES:
+                raise HTTPException(413, "Cover file exceeds 5 MB")
+            raw.extend(chunk)
         if not raw:
             raise HTTPException(400, "Cover file is empty")
-        if len(raw) > _MAX_COVER_BYTES:
-            raise HTTPException(413, "Cover file exceeds 5 MB")
+        existing = required(content.get_book(runtime.conn, book_id))
         covers_dir.mkdir(parents=True, exist_ok=True)
-        filename = f"{book_id}{ext}"
+        filename = f"{book_id}-{new_id()}{ext}"
         target = covers_dir / filename
-        target.write_bytes(raw)
-        if existing.cover_path and Path(existing.cover_path).name != filename:
-            remove_cover_file(existing.cover_path)
-        item = content.update_book(runtime.conn, book_id, cover_path=filename)
+        try:
+            target.write_bytes(raw)
+            item = content.update_book(runtime.conn, book_id, cover_path=filename)
+        except BaseException:
+            target.unlink(missing_ok=True)
+            raise
+        remove_cover_file(existing.cover_path)
         changed(book_id, "book", book_id)
         return item
 
     @router.delete("/books/{book_id}/cover")
     async def delete_book_cover(book_id: str) -> Book:
         existing = required(content.get_book(runtime.conn, book_id))
-        remove_cover_file(existing.cover_path)
         item = content.update_book(runtime.conn, book_id, cover_path="")
+        remove_cover_file(existing.cover_path)
         changed(book_id, "book", book_id)
         return item
 
@@ -387,24 +390,22 @@ def create_router(runtime: ApiRuntime) -> APIRouter:
     async def pending_change(change_id: str) -> PendingChange:
         return required(changes.get_pending_change(runtime.conn, change_id))
 
-    @router.post("/pending-changes/{change_id}/apply")
-    async def apply(change_id: str) -> PendingChange:
-        with ensure_transaction(runtime.conn):
-            pending = required(changes.get_pending_change(runtime.conn, change_id))
-            if pending.action != PendingAction.CREATE:
-                target = required(
-                    content.get_chapter(runtime.conn, pending.target_id or "")
-                    if pending.target_type == TargetType.CHAPTER
-                    else content.get_entry(runtime.conn, pending.target_id or "")
-                )
-                if target.book_id != pending.book_id or target.content != pending.before_content:
-                    raise HTTPException(409, "Pending change no longer matches current content")
-            if pending.target_type == TargetType.CHAPTER:
-                payload = TypeAdapter(dict[str, JsonValue]).validate_json(pending.payload_json)
-                volume_id = payload.get("volume_id")
-                if isinstance(volume_id, str):
-                    check_volume(pending.book_id, volume_id)
-            item = changes.apply_pending_change(runtime.conn, change_id)
+    def check_pending(pending: PendingChange) -> None:
+        if pending.action != PendingAction.CREATE:
+            target = required(
+                content.get_chapter(runtime.conn, pending.target_id or "")
+                if pending.target_type == TargetType.CHAPTER
+                else content.get_entry(runtime.conn, pending.target_id or "")
+            )
+            if target.book_id != pending.book_id or target.content != pending.before_content:
+                raise HTTPException(409, "Pending change no longer matches current content")
+        if pending.target_type == TargetType.CHAPTER:
+            payload = TypeAdapter(dict[str, JsonValue]).validate_json(pending.payload_json)
+            volume_id = payload.get("volume_id")
+            if isinstance(volume_id, str):
+                check_volume(pending.book_id, volume_id)
+
+    def publish_pending(item: PendingChange) -> None:
         runtime.events.publish(
             "content_changed",
             {
@@ -416,6 +417,62 @@ def create_router(runtime: ApiRuntime) -> APIRouter:
                 "target_id": item.target_id,
             },
         )
+
+    def batch_changes(book_id: str, body: BatchChangesInput, *, apply: bool) -> BatchChangesResult:
+        required(content.get_book(runtime.conn, book_id))
+        ids = body.change_ids
+        if ids is None:
+            ids = [
+                item.id
+                for item in reversed(
+                    changes.list_pending_changes(
+                        runtime.conn, book_id, status=PendingStatus.PENDING
+                    )
+                )
+            ]
+        if len(ids) != len(set(ids)):
+            raise HTTPException(422, "Duplicate pending change IDs")
+        updated: list[PendingChange] = []
+        with ensure_transaction(runtime.conn):
+            for change_id in ids:
+                try:
+                    pending = required(changes.get_pending_change(runtime.conn, change_id))
+                    if pending.book_id != book_id:
+                        raise HTTPException(409, "Pending change belongs to another book")
+                    if apply:
+                        check_pending(pending)
+                        updated.append(changes.apply_pending_change(runtime.conn, change_id))
+                    else:
+                        updated.append(changes.reject_pending_change(runtime.conn, change_id))
+                except (HTTPException, LookupError, ValueError) as exc:
+                    raise HTTPException(
+                        409,
+                        detail={
+                            "code": "batch_conflict",
+                            "change_id": change_id,
+                            "atomic": True,
+                            "message": "No changes were committed; refresh the pending change and its target",
+                        },
+                    ) from exc
+        for item in updated:
+            publish_pending(item)
+        return BatchChangesResult(changes=updated, count=len(updated))
+
+    @router.post("/books/{book_id}/pending-changes/apply")
+    async def apply_batch(book_id: str, body: BatchChangesInput) -> BatchChangesResult:
+        return batch_changes(book_id, body, apply=True)
+
+    @router.post("/books/{book_id}/pending-changes/reject")
+    async def reject_batch(book_id: str, body: BatchChangesInput) -> BatchChangesResult:
+        return batch_changes(book_id, body, apply=False)
+
+    @router.post("/pending-changes/{change_id}/apply")
+    async def apply(change_id: str) -> PendingChange:
+        with ensure_transaction(runtime.conn):
+            pending = required(changes.get_pending_change(runtime.conn, change_id))
+            check_pending(pending)
+            item = changes.apply_pending_change(runtime.conn, change_id)
+        publish_pending(item)
         return item
 
     @router.post("/pending-changes/{change_id}/reject")
@@ -445,5 +502,22 @@ def create_router(runtime: ApiRuntime) -> APIRouter:
     @router.get("/revisions/{revision_id}")
     async def get_revision(revision_id: str) -> Revision:
         return required(changes.get_revision(runtime.conn, revision_id))
+
+    def restore(target_type: TargetType, target_id: str, body: RestoreInput) -> RestoreResult:
+        original = required(changes.get_revision(runtime.conn, body.revision_id))
+        required(content.get_book(runtime.conn, original.book_id))
+        item, saved = changes.restore_revision(
+            runtime.conn, body.revision_id, target_type=target_type, target_id=target_id
+        )
+        changed(item.book_id, target_type.value, item.id)
+        return RestoreResult(target=item, revision=saved)
+
+    @router.post("/chapters/{chapter_id}/restore")
+    async def restore_chapter(chapter_id: str, body: RestoreInput) -> RestoreResult:
+        return restore(TargetType.CHAPTER, chapter_id, body)
+
+    @router.post("/entries/{entry_id}/restore")
+    async def restore_entry(entry_id: str, body: RestoreInput) -> RestoreResult:
+        return restore(TargetType.ENTRY, entry_id, body)
 
     return router

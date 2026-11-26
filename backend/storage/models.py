@@ -206,6 +206,7 @@ class Session:
     visibility_scope: Visibility
     created_at: str
     updated_at: str
+    pinned: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,6 +225,9 @@ class Run:
     started_at: str
     finished_at: str | None
     error: ErrorInfo | None = None
+    reasoning_effort: str | None = None
+    references_json: str = "[]"
+    reasoning_duration_ms: int = 0
 
 
 @dataclass(frozen=True, slots=True)
