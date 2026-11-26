@@ -15,6 +15,7 @@ export const bookSchema = z.object({
   rules_markdown: z.string(),
   default_visibility: visibilitySchema,
   updated_at: z.string(),
+  cover_path: z.string().default(""),
 });
 export const volumeSchema = z.object({
   id: z.string(),

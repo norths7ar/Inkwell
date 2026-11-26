@@ -122,6 +122,7 @@ class Book:
     default_visibility: Visibility
     created_at: str
     updated_at: str
+    cover_path: str = ""
 
 
 @dataclass(frozen=True, slots=True)

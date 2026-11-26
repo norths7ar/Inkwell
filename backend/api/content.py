@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Query, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter
 
 from backend.api.runtime import ApiRuntime
@@ -73,8 +75,25 @@ def required[T](value: T | None) -> T:
     return value
 
 
+_COVER_MIME_TO_EXT: dict[str, str] = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+}
+_COVER_EXT_TO_MIME: dict[str, str] = {ext: mime for mime, ext in _COVER_MIME_TO_EXT.items()}
+_MAX_COVER_BYTES = 5 * 1024 * 1024
+
+
 def create_router(runtime: ApiRuntime) -> APIRouter:
     router = APIRouter()
+    covers_dir = runtime.config.attachments_dir / "covers"
+
+    def remove_cover_file(cover_path: str) -> None:
+        if not cover_path:
+            return
+        target = covers_dir / Path(cover_path).name
+        if target.is_file():
+            target.unlink()
 
     def changed(book_id: str, resource: str, resource_id: str) -> None:
         runtime.events.publish(
@@ -151,11 +170,53 @@ def create_router(runtime: ApiRuntime) -> APIRouter:
 
     @router.delete("/books/{book_id}", status_code=204)
     async def remove_book(book_id: str) -> Response:
-        required(content.get_book(runtime.conn, book_id))
+        existing = required(content.get_book(runtime.conn, book_id))
         runtime.ensure_book_idle(book_id)
         content.delete_book(runtime.conn, book_id)
+        remove_cover_file(existing.cover_path)
         changed(book_id, "book", book_id)
         return Response(status_code=204)
+
+    @router.get("/books/{book_id}/cover")
+    async def get_book_cover(book_id: str) -> FileResponse:
+        existing = required(content.get_book(runtime.conn, book_id))
+        if not existing.cover_path:
+            raise HTTPException(404, "Cover not found")
+        target = covers_dir / Path(existing.cover_path).name
+        if not target.is_file():
+            raise HTTPException(404, "Cover not found")
+        media_type = _COVER_EXT_TO_MIME.get(target.suffix.lower(), "application/octet-stream")
+        return FileResponse(target, media_type=media_type, headers={"Cache-Control": "no-cache"})
+
+    @router.put("/books/{book_id}/cover")
+    async def upload_book_cover(book_id: str, request: Request) -> Book:
+        existing = required(content.get_book(runtime.conn, book_id))
+        media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        ext = _COVER_MIME_TO_EXT.get(media_type)
+        if ext is None:
+            raise HTTPException(415, "Cover must be JPEG, PNG, or WebP")
+        raw = await request.body()
+        if not raw:
+            raise HTTPException(400, "Cover file is empty")
+        if len(raw) > _MAX_COVER_BYTES:
+            raise HTTPException(413, "Cover file exceeds 5 MB")
+        covers_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{book_id}{ext}"
+        target = covers_dir / filename
+        target.write_bytes(raw)
+        if existing.cover_path and Path(existing.cover_path).name != filename:
+            remove_cover_file(existing.cover_path)
+        item = content.update_book(runtime.conn, book_id, cover_path=filename)
+        changed(book_id, "book", book_id)
+        return item
+
+    @router.delete("/books/{book_id}/cover")
+    async def delete_book_cover(book_id: str) -> Book:
+        existing = required(content.get_book(runtime.conn, book_id))
+        remove_cover_file(existing.cover_path)
+        item = content.update_book(runtime.conn, book_id, cover_path="")
+        changed(book_id, "book", book_id)
+        return item
 
     @router.get("/books/{book_id}/volumes")
     async def volumes(book_id: str) -> list[Volume]:

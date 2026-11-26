@@ -273,6 +273,17 @@
     align-items: baseline;
     justify-content: space-between;
   }
+  .shelf-brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .shelf-logo {
+    width: 30px;
+    height: 30px;
+    border-radius: 7px;
+    flex-shrink: 0;
+  }
   .shelf-heading h1 {
     font-family: Georgia, "Noto Serif SC", "Microsoft YaHei", serif;
     font-size: 30px;
@@ -362,6 +373,40 @@
     gap: 14px;
     text-align: center;
     color: #f4f4f5;
+  }
+  .book-cover-image {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+  .book-cover-editor {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+  .book-cover-thumb {
+    width: 76px;
+    height: 114px;
+    flex-shrink: 0;
+    overflow: hidden;
+    border-radius: 3px 8px 8px 3px;
+    border: 1px solid #e4e4e7;
+    background: linear-gradient(145deg, #27272a 0%, #3f3f46 100%);
+  }
+  .book-cover-thumb-empty {
+    display: flex;
+    height: 100%;
+    width: 100%;
+    align-items: center;
+    justify-content: center;
+    color: rgba(244, 244, 245, 0.72);
+  }
+  .book-cover-controls {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
   }
   .book-cover-frame svg {
     opacity: 0.78;

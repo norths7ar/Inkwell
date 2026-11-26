@@ -1369,7 +1369,10 @@ export function Workspace({
               <div className="shelf">
                 <header className="shelf-header">
                   <div className="shelf-heading">
-                    <h1>书架</h1>
+                    <div className="shelf-brand">
+                      <img src="/inkwell.svg" alt="" className="shelf-logo" />
+                      <h1>书架</h1>
+                    </div>
                   </div>
                   <div className="shelf-actions">
                     <Button variant="primary" onClick={onNewBook}>
@@ -1403,10 +1406,18 @@ export function Workspace({
                           }}
                         >
                           <div className="book-cover">
-                            <div className="book-cover-frame">
-                              <BookOpen size={30} />
-                              <span className="book-cover-title">{item.title}</span>
-                            </div>
+                            {item.cover_path ? (
+                              <img
+                                className="book-cover-image"
+                                src={`/api/books/${item.id}/cover?v=${encodeURIComponent(item.updated_at)}`}
+                                alt={item.title}
+                              />
+                            ) : (
+                              <div className="book-cover-frame">
+                                <BookOpen size={30} />
+                                <span className="book-cover-title">{item.title}</span>
+                              </div>
+                            )}
                           </div>
                           <div className="book-card-details">
                             <span className="book-card-title">{item.title}</span>

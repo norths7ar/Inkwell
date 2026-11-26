@@ -6,7 +6,7 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _V1_STATEMENTS: tuple[str, ...] = (
     """
@@ -214,6 +214,7 @@ _V1_STATEMENTS: tuple[str, ...] = (
 MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (1, _V1_STATEMENTS),
     (2, ("ALTER TABLE runs ADD COLUMN error_json TEXT",)),
+    (3, ("ALTER TABLE books ADD COLUMN cover_path TEXT NOT NULL DEFAULT ''",)),
 )
 
 

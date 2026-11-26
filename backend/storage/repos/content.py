@@ -74,6 +74,7 @@ def _book_from_row(row: sqlite3.Row) -> Book:
         default_visibility=Visibility(str(row["default_visibility"])),
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
+        cover_path=str(row["cover_path"]),
     )
 
 
@@ -128,6 +129,7 @@ def create_book(
     description: str = "",
     rules_markdown: str = "",
     default_visibility: Visibility = Visibility.LOCAL,
+    cover_path: str = "",
     book_id: str | None = None,
 ) -> Book:
     now = utc_now()
@@ -136,9 +138,10 @@ def create_book(
         conn.execute(
             """
             INSERT INTO books (
-                id, title, description, rules_markdown, default_visibility, created_at, updated_at
+                id, title, description, rules_markdown, default_visibility, cover_path,
+                created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 resolved_id,
@@ -146,6 +149,7 @@ def create_book(
                 description,
                 rules_markdown,
                 default_visibility.value,
+                cover_path,
                 now,
                 now,
             ),
@@ -174,6 +178,7 @@ def update_book(
     description: str | Unset = UNSET,
     rules_markdown: str | Unset = UNSET,
     default_visibility: Visibility | Unset = UNSET,
+    cover_path: str | Unset = UNSET,
 ) -> Book:
     existing = get_book(conn, book_id)
     if existing is None:
@@ -184,7 +189,7 @@ def update_book(
             """
             UPDATE books
             SET title = ?, description = ?, rules_markdown = ?, default_visibility = ?,
-                updated_at = ?
+                cover_path = ?, updated_at = ?
             WHERE id = ?
             """,
             (
@@ -196,6 +201,7 @@ def update_book(
                     if isinstance(default_visibility, Unset)
                     else default_visibility
                 ).value,
+                existing.cover_path if isinstance(cover_path, Unset) else cover_path,
                 now,
                 book_id,
             ),

@@ -18,17 +18,7 @@ const failureSchema = z.object({
   error: z.object({ message: z.string(), category: z.string() }).optional(),
 });
 
-export async function request<T>(
-  path: string,
-  schema: z.ZodType<T>,
-  options: { method?: string; body?: unknown; signal?: AbortSignal } = {},
-): Promise<T> {
-  const response = await fetch(`/api${path}`, {
-    method: options.method ?? "GET",
-    signal: options.signal,
-    headers: options.body === undefined ? undefined : { "Content-Type": "application/json" },
-    body: options.body === undefined ? undefined : JSON.stringify(options.body),
-  });
+async function parseResponse<T>(response: Response, schema: z.ZodType<T>): Promise<T> {
   if (!response.ok) {
     const raw: unknown = await response.json().catch(() => null);
     const parsed = failureSchema.safeParse(raw);
@@ -45,6 +35,34 @@ export async function request<T>(
   }
   const data: unknown = response.status === 204 ? null : await response.json();
   return schema.parse(data);
+}
+
+export async function request<T>(
+  path: string,
+  schema: z.ZodType<T>,
+  options: { method?: string; body?: unknown; signal?: AbortSignal } = {},
+): Promise<T> {
+  const response = await fetch(`/api${path}`, {
+    method: options.method ?? "GET",
+    signal: options.signal,
+    headers: options.body === undefined ? undefined : { "Content-Type": "application/json" },
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+  });
+  return parseResponse(response, schema);
+}
+
+export async function upload<T>(
+  path: string,
+  schema: z.ZodType<T>,
+  file: File,
+  method = "PUT",
+): Promise<T> {
+  const response = await fetch(`/api${path}`, {
+    method,
+    headers: { "Content-Type": file.type || "application/octet-stream" },
+    body: file,
+  });
+  return parseResponse(response, schema);
 }
 export const remove = (path: string) => request(path, z.null(), { method: "DELETE" });
 export function errorText(error: unknown): string {
