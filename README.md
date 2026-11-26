@@ -19,10 +19,10 @@ Inkwell（墨匣）是一个从零构建的个人本地 AI 小说写作工作台
 
 ```powershell
 uv sync --frozen
-uv run python -m backend serve --host 127.0.0.1 --port 8765
+uv run python -m backend serve --host 127.0.0.1 --port 18082
 ```
 
-打开 `http://127.0.0.1:8765/docs` 查看交互式 API 文档，`/health` 返回就绪状态。`--port 0` 可由操作系统分配端口，实际地址见启动日志。`frontend/dist` 存在时同源托管静态文件与前端页面路由；不存在时正常运行纯 API 服务。
+打开 `http://127.0.0.1:18082/docs` 查看交互式 API 文档，`/health` 返回就绪状态。`--port 0` 可由操作系统分配端口，实际地址见启动日志。`frontend/dist` 存在时同源托管静态文件与前端页面路由；不存在时正常运行纯 API 服务。
 
 数据目录可通过 `INKWELL_DATA_DIR` 或 `--data-dir` 指定，默认使用当前用户的数据目录（Windows 为 `%LOCALAPPDATA%/Inkwell`）。数据库、加密密钥、附件、服务运行记录和日志均存于该目录。`INKWELL_HOST` 与 `INKWELL_PORT` 可设置默认监听参数；命令行参数优先。默认监听回环地址，当前服务没有远程用户认证，不应直接暴露到公网。
 
@@ -47,7 +47,7 @@ pnpm install --frozen-lockfile
 pnpm dev
 ```
 
-另一个终端启动上述后端，浏览器访问 Vite 输出的本地地址。开发代理将 `/api` 转发到 `127.0.0.1:8765`。执行 `pnpm build` 后，产物写入 `frontend/dist`；重启后端即可直接从后端地址打开同源工作台。
+另一个终端启动上述后端，浏览器访问 Vite 输出的本地地址。开发代理将 `/api` 转发到 `127.0.0.1:18082`。执行 `pnpm build` 后，产物写入 `frontend/dist`；重启后端即可直接从后端地址打开同源工作台。
 
 在书架新建作品，进入工作台后从左侧创建分卷、章节或设定。中栏使用纯文本 Markdown；点击保存或按 `Ctrl+S` 才写入数据库和修订历史。停笔 500ms 后的未保存改动仅暂存当前浏览器的 `localStorage`，切章前可保存、保留草稿或取消；下次打开同一条目会恢复草稿。草稿按浏览器站点隔离，开发地址和生产地址不共享，清除浏览器数据也会清除草稿。
 

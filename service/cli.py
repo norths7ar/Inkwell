@@ -44,7 +44,7 @@ def parser() -> argparse.ArgumentParser:
         choices=("start", "stop", "restart", "status"),
     )
     result.add_argument("--host", help="Listener host (default: INKWELL_HOST or 127.0.0.1).")
-    result.add_argument("--port", type=int, help="Port (default: INKWELL_PORT or 8765).")
+    result.add_argument("--port", type=int, help="Port (default: INKWELL_PORT or 18082).")
     result.add_argument(
         "--data-path",
         "--data-dir",
