@@ -2146,10 +2146,9 @@ function BookChat({
     const contextLimit = latestModel?.context_window ?? null;
     const latestInput = latestWithTokens?.input_tokens ?? 0;
     if (totals.input > 0 || totals.output > 0 || (selectedCompactions?.length ?? 0) > 0) {
-      const pct =
-        contextLimit && contextLimit > 0
-          ? Math.min(100, (latestInput / contextLimit) * 100).toFixed(1)
-          : null;
+      const ratio = contextLimit && contextLimit > 0 ? latestInput / contextLimit : null;
+      const pct = ratio !== null ? Math.min(100, ratio * 100).toFixed(1) : null;
+      const highContext = ratio !== null && ratio >= 0.75;
       usageRow = (
         <div className="chat-header-usage">
           <span>
@@ -2162,6 +2161,18 @@ function BookChat({
                 上下文 {formatTokenCount(latestInput)}
                 {contextLimit ? ` / ${formatTokenCount(contextLimit)} (${pct}%)` : ""}
               </span>
+            )}
+            {highContext && (
+              <button
+                type="button"
+                className="chat-compact-alert"
+                title="上下文占用已超过 75%，建议压缩早期历史以保持响应质量"
+                disabled={compacting || hasActiveRun}
+                onClick={() => void compactSession()}
+              >
+                <Minimize2 size={10} />
+                <span>{compacting ? "压缩中…" : "建议压缩"}</span>
+              </button>
             )}
             {(selectedCompactions?.length ?? 0) > 0 && <Badge>已压缩</Badge>}
           </div>

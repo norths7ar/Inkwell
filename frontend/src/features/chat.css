@@ -655,6 +655,34 @@
   background: #f8fafc;
 }
 
+.chat-compact-alert {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 20px;
+  padding: 0 7px;
+  border: 1px solid #fcd34d;
+  border-radius: 9999px;
+  background: #fffbeb;
+  color: #92400e;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition:
+    background-color 140ms ease,
+    border-color 140ms ease;
+}
+
+.chat-compact-alert:hover:not(:disabled) {
+  background: #fef3c7;
+  border-color: #f59e0b;
+}
+
+.chat-compact-alert:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .composer-ref-chip span {
   overflow: hidden;
   text-overflow: ellipsis;
