@@ -100,6 +100,9 @@ const toolNames: Readonly<Record<string, string>> = {
   search_content: "搜索作品",
   propose_entry_edit: "提出设定修改",
   propose_chapter_edit: "提出章节修改",
+  list_pending_changes: "查看待审变更",
+  read_pending_change: "读取待审变更",
+  revise_pending_change: "修订待审变更",
   ask_user: "确认问题",
 };
 
@@ -122,6 +125,9 @@ const fieldNames: Readonly<Record<string, string>> = {
   action: "操作",
   before_content: "修改前",
   after_content: "修改后",
+  edits: "局部替换",
+  expected_revision: "期望版本",
+  pending_changes: "待审列表",
   status: "状态",
   visibility: "可见范围",
   category: "分类",
@@ -1407,7 +1413,10 @@ function SessionChat({
               : tool,
           ),
         }));
-      } else if (event.type === "pending_change_created") {
+      } else if (
+        event.type === "pending_change_created" ||
+        event.type === "pending_change_updated"
+      ) {
         setPending((old) => [
           ...old.filter((item) => item.id !== event.change.id),
           { id: event.change.id, title: event.change.title || "待审建议" },

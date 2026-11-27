@@ -13,6 +13,7 @@ from backend.agent.events import (
     AttemptResetEvent,
     EventSink,
     PendingChangeCreatedEvent,
+    PendingChangeUpdatedEvent,
     ReasoningCompletedEvent,
     RunFinishedEvent,
     RunStartedEvent,
@@ -382,6 +383,11 @@ class AgentRunner:
                 await emit_event(
                     sink,
                     PendingChangeCreatedEvent(tool_ctx.run_id, res.created_change),
+                )
+            if res.updated_change is not None:
+                await emit_event(
+                    sink,
+                    PendingChangeUpdatedEvent(tool_ctx.run_id, res.updated_change),
                 )
             await emit_event(
                 sink,

@@ -12,6 +12,7 @@ import {
   Eye,
   FileCode2,
   FileText,
+  GitCompareArrows,
   History,
   MessageSquareQuote,
   RotateCcw,
@@ -45,6 +46,8 @@ export function Editor({
   onSave,
   onHistory,
   onQuoteSelection,
+  pendingCount = 0,
+  onOpenPending,
   ref,
   toolbarStart,
   toolbarEnd,
@@ -61,6 +64,8 @@ export function Editor({
     startLine: number;
     endLine: number;
   }) => void;
+  pendingCount?: number;
+  onOpenPending?: () => void;
   ref?: Ref<EditorHandle>;
   toolbarStart?: ReactNode;
   toolbarEnd?: ReactNode;
@@ -327,6 +332,17 @@ export function Editor({
           </span>
         </div>
         <div className="row editor-actions">
+          {pendingCount > 0 && onOpenPending && (
+            <button
+              type="button"
+              className="editor-pending-pill"
+              title={`查看当前文档的 ${pendingCount} 条待审变更`}
+              onClick={onOpenPending}
+            >
+              <GitCompareArrows size={13} />
+              <span>待审 {pendingCount}</span>
+            </button>
+          )}
           {!preview && onQuoteSelection && hasSelection && (
             <Button
               variant="ghost"

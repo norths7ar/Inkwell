@@ -531,6 +531,28 @@
     background: #3f3f46;
     color: #ffffff;
   }
+  .editor-pending-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 26px;
+    padding: 0 9px;
+    border-radius: 9999px;
+    border: 1px solid #fcd34d;
+    background: #fffbeb;
+    color: #92400e;
+    font-size: 12px;
+    font-weight: 500;
+    white-space: nowrap;
+    cursor: pointer;
+    transition:
+      background-color 140ms ease,
+      border-color 140ms ease;
+  }
+  .editor-pending-pill:hover {
+    background: #fef3c7;
+    border-color: #f59e0b;
+  }
   .toolbar-divider {
     width: 1px;
     height: 16px;

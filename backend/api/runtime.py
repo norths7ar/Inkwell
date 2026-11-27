@@ -282,6 +282,7 @@ class ApiRuntime:
             agent_events.ToolStartedEvent: "tool_start",
             agent_events.ToolFinishedEvent: "tool_result",
             agent_events.PendingChangeCreatedEvent: "pending_change_created",
+            agent_events.PendingChangeUpdatedEvent: "pending_change_updated",
             agent_events.WaitingUserEvent: "waiting_user",
             agent_events.RunFinishedEvent: "run_done",
         }
@@ -292,11 +293,26 @@ class ApiRuntime:
             payload["reasoning_duration_ms"] = current.reasoning_duration_ms if current else 0
         self.events.publish(names[type(event)], payload)
         if isinstance(
-            event, (agent_events.PendingChangeCreatedEvent, agent_events.RunFinishedEvent)
+            event,
+            (
+                agent_events.PendingChangeCreatedEvent,
+                agent_events.PendingChangeUpdatedEvent,
+                agent_events.RunFinishedEvent,
+            ),
         ):
+            refresh: dict[str, JsonValue] = {
+                "book_id": run.book_id,
+                "session_id": run.session_id,
+                "run_id": run.id,
+            }
+            if isinstance(
+                event,
+                (agent_events.PendingChangeCreatedEvent, agent_events.PendingChangeUpdatedEvent),
+            ):
+                refresh.update(resource="pending_change", resource_id=event.change.id)
             self.events.publish(
                 "content_changed",
-                {"book_id": run.book_id, "session_id": run.session_id, "run_id": run.id},
+                refresh,
             )
 
     async def _execute(

@@ -73,6 +73,12 @@ class PendingChangeCreatedEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class PendingChangeUpdatedEvent:
+    run_id: str
+    change: PendingChange
+
+
+@dataclass(frozen=True, slots=True)
 class WaitingUserEvent:
     run_id: str
     question: str
@@ -97,6 +103,7 @@ type AgentEvent = (
     | ToolStartedEvent
     | ToolFinishedEvent
     | PendingChangeCreatedEvent
+    | PendingChangeUpdatedEvent
     | WaitingUserEvent
     | RunFinishedEvent
 )

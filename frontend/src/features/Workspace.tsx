@@ -1330,6 +1330,16 @@ export function Workspace({
   const editing = route === "chapters" || isEntryRoute(route);
   const sidebarClosed = route === "shelf" || sidebarCollapsed;
 
+  const currentDocPending = useMemo(
+    () =>
+      selected
+        ? data.changes.filter(
+            (change) => change.target_type === selected.kind && change.target_id === selected.id,
+          )
+        : [],
+    [data.changes, selected],
+  );
+
   const currentFocus: FocusTarget | null = useMemo(() => {
     if (!editing || !selected) return null;
     if (selected.kind === "chapter") {
@@ -2473,6 +2483,13 @@ export function Workspace({
                     }
                     onSave={save}
                     onHistory={() => setHistoryOpen(true)}
+                    pendingCount={currentDocPending.length}
+                    onOpenPending={() => {
+                      const first = currentDocPending[0];
+                      if (first) setFocusPending(first.id);
+                      onRouteChange("pending");
+                      setSidebarCollapsed(false);
+                    }}
                     onQuoteSelection={({ selectedText, startLine, endLine }) => {
                       setCompanionOpen(true);
                       setPendingExcerpt({

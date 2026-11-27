@@ -327,6 +327,7 @@ export const eventSchema = z.discriminatedUnion("type", [
     is_error: z.boolean(),
   }),
   z.object({ type: z.literal("pending_change_created"), ...ownership, change: pendingSchema }),
+  z.object({ type: z.literal("pending_change_updated"), ...ownership, change: pendingSchema }),
   z.object({
     type: z.literal("waiting_user"),
     ...ownership,

@@ -6,10 +6,13 @@ import json
 import sqlite3
 from collections.abc import Callable
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from typing import Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
+from backend.agent import pending
+from backend.agent.edits import TextEdit, apply_edits
 from backend.llm._json import JsonObject, coerce_json_value
 from backend.llm.types import ToolSpec
 from backend.storage.db import Database
@@ -17,12 +20,17 @@ from backend.storage.models import (
     EntryKind,
     PendingAction,
     PendingChange,
+    PendingStatus,
     SessionMode,
     TargetType,
     Visibility,
     validate_entry_meta,
 )
-from backend.storage.repos.changes import create_pending_change
+from backend.storage.repos.changes import (
+    create_pending_change,
+    get_pending_change,
+    list_pending_changes,
+)
 from backend.storage.repos.content import (
     get_chapter,
     get_entry,
@@ -32,6 +40,7 @@ from backend.storage.repos.content import (
     list_volumes,
     search_book_content,
 )
+from backend.storage.repos.sessions import get_session
 
 _MAX_VALIDATION_INPUT_PREVIEW = 120
 
@@ -92,6 +101,7 @@ class ToolExecutionResult:
     is_error: bool = False
     created_change: PendingChange | None = None
     suspend_question: tuple[str, tuple[str, ...]] | None = None
+    updated_change: PendingChange | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,6 +213,12 @@ class _ProposeEntryEditArgs(BaseModel):
     title: str = Field(default="", description="条目标题。")
     category: str = Field(default="", description="可选分组或标签。")
     content: str = Field(default="", description="条目 Markdown 正文。")
+    edits: list[TextEdit] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=50,
+        description="update 时按顺序局部替换，与 content 互斥。",
+    )
     visibility: Visibility = Field(
         default=Visibility.LOCAL, description="可见性：local 或 global。"
     )
@@ -216,6 +232,12 @@ class _ProposeChapterEditArgs(BaseModel):
     volume_id: str | None = Field(default=None, description="可选所属分卷 ID。")
     title: str = Field(default="", description="章节标题。")
     content: str = Field(default="", description="章节正文。")
+    edits: list[TextEdit] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=50,
+        description="update 时按顺序局部替换，与 content 互斥。",
+    )
     summary: str | None = Field(default=None, description="可选章节摘要。")
     sort_order: int | None = Field(default=None, description="可选排序值。")
 
@@ -223,6 +245,23 @@ class _ProposeChapterEditArgs(BaseModel):
 class _AskUserArgs(BaseModel):
     question: str = Field(min_length=1, description="向作者提出的明确问题。")
     options: list[str] = Field(default_factory=list, description="可选建议选项列表。")
+
+
+class _ListPendingArgs(BaseModel):
+    scope: Literal["session", "book"] = "session"
+
+
+class _ReadPendingArgs(BaseModel):
+    change_id: str = Field(min_length=1)
+
+
+class _RevisePendingArgs(_ReadPendingArgs):
+    expected_revision: str = Field(
+        min_length=64, max_length=64, description="最近读取提案返回的 revision_token。"
+    )
+    content: str | None = Field(default=None, max_length=1_000_000)
+    edits: list[TextEdit] | None = Field(default=None, min_length=1, max_length=50)
+    title: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +408,16 @@ def _handle_search_content(ctx: ToolContext, args: _SearchContentArgs) -> ToolEx
     return _ok({"hits": filtered})
 
 
+def _proposed_content(args: _ProposeEntryEditArgs | _ProposeChapterEditArgs, before: str) -> str:
+    if args.edits is not None:
+        if "content" in args.model_fields_set or args.action != PendingAction.UPDATE:
+            raise ValueError("edits requires action=update and cannot be combined with content")
+        return apply_edits(before, args.edits)
+    if args.action == PendingAction.UPDATE and "content" not in args.model_fields_set:
+        return before
+    return args.content
+
+
 def _handle_propose_entry_edit(
     ctx: ToolContext,
     args: _ProposeEntryEditArgs,
@@ -380,15 +429,14 @@ def _handle_propose_entry_edit(
     ):
         return _err("forbidden", "Cannot create global entry inside local visibility scope")
 
-    try:
-        normalized_meta = validate_entry_meta(args.kind, args.meta_json)
-    except Exception as exc:
-        return _err("validation_error", f"Invalid meta_json: {exc}")
-
     with ctx.db.transaction() as conn:
         before_content = ""
         resolved_title = args.title
         resolved_kind = args.kind
+        resolved_category = args.category
+        resolved_visibility = args.visibility
+        resolved_meta = args.meta_json
+        resolved_sort = args.sort_order
         if args.action != PendingAction.CREATE:
             if not args.target_id:
                 return _err("validation_error", "target_id is required for update or delete")
@@ -398,17 +446,30 @@ def _handle_propose_entry_edit(
             if not _entry_visible(existing.visibility, ctx.visibility_scope):
                 return _err("forbidden", "Entry is outside local visibility scope")
             before_content = existing.content
-            if not resolved_title:
+            if "title" not in args.model_fields_set:
                 resolved_title = existing.title
             resolved_kind = existing.kind
+            if "category" not in args.model_fields_set:
+                resolved_category = existing.category
+            if "visibility" not in args.model_fields_set:
+                resolved_visibility = existing.visibility
+            if "meta_json" not in args.model_fields_set:
+                resolved_meta = existing.meta_json
+            if "sort_order" not in args.model_fields_set:
+                resolved_sort = existing.sort_order
+
+        if not _entry_visible(resolved_visibility, ctx.visibility_scope):
+            return _err("forbidden", "Cannot propose global entry inside local visibility scope")
+        normalized_meta = validate_entry_meta(resolved_kind, resolved_meta)
+        after_content = _proposed_content(args, before_content)
 
         payload = json.dumps(
             {
                 "kind": resolved_kind.value,
-                "category": args.category,
-                "visibility": args.visibility.value,
+                "category": resolved_category,
+                "visibility": resolved_visibility.value,
                 "meta_json": normalized_meta,
-                "sort_order": args.sort_order,
+                "sort_order": resolved_sort,
             },
             ensure_ascii=False,
         )
@@ -422,7 +483,7 @@ def _handle_propose_entry_edit(
             action=args.action,
             title=resolved_title,
             before_content=before_content,
-            after_content=args.content,
+            after_content=after_content,
             payload_json=payload,
         )
     return ToolExecutionResult(
@@ -459,7 +520,7 @@ def _handle_propose_chapter_edit(
             if existing is None or existing.book_id != ctx.book_id:
                 return _err("not_found", f"Chapter not found in current book: {args.target_id}")
             before_content = existing.content
-            if not resolved_title:
+            if "title" not in args.model_fields_set:
                 resolved_title = existing.title
 
         payload_dict: dict[str, str | int | None] = {}
@@ -480,7 +541,7 @@ def _handle_propose_chapter_edit(
             action=args.action,
             title=resolved_title,
             before_content=before_content,
-            after_content=args.content,
+            after_content=_proposed_content(args, before_content),
             payload_json=json.dumps(payload_dict, ensure_ascii=False),
         )
     return ToolExecutionResult(
@@ -506,6 +567,80 @@ def _handle_ask_user(_ctx: ToolContext, args: _AskUserArgs) -> ToolExecutionResu
         ),
         suspend_question=(args.question, tuple(args.options)),
     )
+
+
+def _pending_data(change: PendingChange) -> dict[str, object]:
+    return {**asdict(change), "revision_token": pending.revision_token(change)}
+
+
+def _handle_list_pending(ctx: ToolContext, args: _ListPendingArgs) -> ToolExecutionResult:
+    with closing(ctx.db.connect()) as conn:
+        changes = list_pending_changes(conn, ctx.book_id, status=PendingStatus.PENDING)
+        items = [
+            {
+                "id": item.id,
+                "session_id": item.session_id,
+                "target_type": item.target_type,
+                "target_id": item.target_id,
+                "action": item.action,
+                "title": item.title,
+                "revision_token": pending.revision_token(item),
+            }
+            for item in changes
+            if (args.scope == "book" or item.session_id == ctx.session_id)
+            and pending.visible(conn, item, ctx.book_id, ctx.visibility_scope)
+        ]
+    return _ok({"changes": items})
+
+
+def _handle_read_pending(ctx: ToolContext, args: _ReadPendingArgs) -> ToolExecutionResult:
+    with closing(ctx.db.connect()) as conn:
+        change = get_pending_change(conn, args.change_id)
+        if change is None or not pending.visible(conn, change, ctx.book_id, ctx.visibility_scope):
+            return _err("not_found", "Proposal not found in current visible book content")
+        if change.status != PendingStatus.PENDING:
+            return _err("conflict", "Proposal is no longer pending")
+    return _ok(_pending_data(change))
+
+
+def _handle_revise_pending(ctx: ToolContext, args: _RevisePendingArgs) -> ToolExecutionResult:
+    if args.content is not None and args.edits is not None:
+        return _err("validation_error", "content and edits are mutually exclusive")
+    if args.content is None and args.edits is None and args.title is None:
+        return _err("validation_error", "Provide content, edits or title")
+    with ctx.db.transaction() as conn:
+        change = get_pending_change(conn, args.change_id)
+        if change is None or not pending.visible(conn, change, ctx.book_id, ctx.visibility_scope):
+            return _err("not_found", "Proposal not found in current visible book content")
+        session = get_session(conn, ctx.session_id)
+        if (
+            session is None
+            or session.mode == SessionMode.REVIEW
+            or (session.mode == SessionMode.DISCUSS and change.target_type == TargetType.CHAPTER)
+        ):
+            return _err("forbidden", "Current mode cannot revise this proposal type")
+        if (
+            change.status != PendingStatus.PENDING
+            or pending.revision_token(change) != args.expected_revision
+        ):
+            return _err(
+                "conflict", "Proposal changed or was resolved; read it again before revising"
+            )
+        if change.action == PendingAction.DELETE:
+            return _err("validation_error", "Deletion proposals have no draft content to revise")
+        content = (
+            apply_edits(change.after_content, args.edits)
+            if args.edits is not None
+            else (args.content if args.content is not None else change.after_content)
+        )
+        updated = pending.revise(
+            conn,
+            change,
+            args.expected_revision,
+            content,
+            args.title if args.title is not None else change.title,
+        )
+    return ToolExecutionResult(content=_ok(_pending_data(updated)).content, updated_change=updated)
 
 
 # ---------------------------------------------------------------------------
@@ -538,7 +673,7 @@ READ_SUMMARIES_TOOL = _bind_tool(
 
 READ_ENTRIES_TOOL = _bind_tool(
     name="read_entries",
-    description="读取当前可见范围内的人物、世界观或笔记条目；只读。",
+    description="读取当前可见范围内的人物、世界观、提纲或笔记条目；只读。",
     args_model=_ReadEntriesArgs,
     read_only=True,
     handler=_handle_read_entries,
@@ -554,7 +689,7 @@ SEARCH_CONTENT_TOOL = _bind_tool(
 
 PROPOSE_ENTRY_EDIT_TOOL = _bind_tool(
     name="propose_entry_edit",
-    description="提交人物、世界观或笔记的新建/修改/删除待审草案，不直接覆盖正式资料。",
+    description="提交人物、世界观、提纲或笔记的新建/修改/删除待审草案，不直接覆盖正式资料。update 可用 edits 局部替换或 content 全量正文，未传元数据保留原值。",
     args_model=_ProposeEntryEditArgs,
     read_only=False,
     handler=_handle_propose_entry_edit,
@@ -562,7 +697,7 @@ PROPOSE_ENTRY_EDIT_TOOL = _bind_tool(
 
 PROPOSE_CHAPTER_EDIT_TOOL = _bind_tool(
     name="propose_chapter_edit",
-    description="提交章节的新建/修改/删除待审草案，待作者确认后应用到正文，不阻塞后续对话。",
+    description="提交章节的新建/修改/删除待审草案，待作者确认后应用到正文，不阻塞后续对话。update 可用 edits 局部替换或 content 全量正文，两者互斥。",
     args_model=_ProposeChapterEditArgs,
     read_only=False,
     handler=_handle_propose_chapter_edit,
@@ -576,6 +711,30 @@ ASK_USER_TOOL = _bind_tool(
     handler=_handle_ask_user,
 )
 
+LIST_PENDING_CHANGES_TOOL = _bind_tool(
+    name="list_pending_changes",
+    description="列出当前会话或全书可见的待审提案概要，不读取正式正文。",
+    args_model=_ListPendingArgs,
+    read_only=True,
+    handler=_handle_list_pending,
+)
+READ_PENDING_CHANGE_TOOL = _bind_tool(
+    name="read_pending_change",
+    description="读取可见待审提案的原文、草案与 revision_token，修订前必须先读取。",
+    args_model=_ReadPendingArgs,
+    read_only=True,
+    handler=_handle_read_pending,
+)
+REVISE_PENDING_CHANGE_TOOL = _bind_tool(
+    name="revise_pending_change",
+    description="修订已有 pending 提案而非另建提案。edits 针对草案 after_content；content 全量替换，两者互斥。必须携带最新 revision_token 作为 expected_revision；保留原始正文基线和元数据。",
+    args_model=_RevisePendingArgs,
+    read_only=False,
+    handler=_handle_revise_pending,
+)
+
+_PENDING_TOOLS = (LIST_PENDING_CHANGES_TOOL, READ_PENDING_CHANGE_TOOL, REVISE_PENDING_CHANGE_TOOL)
+
 _READ_ONLY_TOOLS: tuple[BoundTool, ...] = (
     LIST_CHAPTERS_TOOL,
     READ_CHAPTER_TOOL,
@@ -586,11 +745,17 @@ _READ_ONLY_TOOLS: tuple[BoundTool, ...] = (
 
 _MODE_TOOLS: dict[SessionMode, tuple[BoundTool, ...]] = {
     SessionMode.REVIEW: _READ_ONLY_TOOLS,
-    SessionMode.DISCUSS: (*_READ_ONLY_TOOLS, PROPOSE_ENTRY_EDIT_TOOL, ASK_USER_TOOL),
+    SessionMode.DISCUSS: (
+        *_READ_ONLY_TOOLS,
+        PROPOSE_ENTRY_EDIT_TOOL,
+        *_PENDING_TOOLS,
+        ASK_USER_TOOL,
+    ),
     SessionMode.WRITE: (
         *_READ_ONLY_TOOLS,
         PROPOSE_ENTRY_EDIT_TOOL,
         PROPOSE_CHAPTER_EDIT_TOOL,
+        *_PENDING_TOOLS,
         ASK_USER_TOOL,
     ),
 }
