@@ -30,6 +30,8 @@ def build_auth_headers(
         headers["Authorization"] = f"Bearer {endpoint.api_key}"
     elif endpoint.auth_style == AuthStyle.X_API_KEY and endpoint.api_key:
         headers["x-api-key"] = endpoint.api_key
+    elif endpoint.auth_style == AuthStyle.X_GOOG_API_KEY and endpoint.api_key:
+        headers["x-goog-api-key"] = endpoint.api_key
 
     for key, value in endpoint.quirks.extra_headers:
         headers[key] = value

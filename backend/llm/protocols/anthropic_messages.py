@@ -32,6 +32,7 @@ from backend.llm.types import (
     ToolCallDeltaEvent,
     ToolResultBlock,
     UsageEvent,
+    WireProtocol,
 )
 
 ANTHROPIC_VERSION = "2023-06-01"
@@ -97,7 +98,7 @@ def _encode_messages(messages: tuple[LLMMessage, ...]) -> tuple[str | None, list
             blocks = []
             for block in msg.blocks:
                 if isinstance(block, ReasoningBlock):
-                    if block.signature:
+                    if block.signature and block.signature_protocol != WireProtocol.GOOGLE_GENAI:
                         blocks.append(
                             {
                                 "type": "thinking",

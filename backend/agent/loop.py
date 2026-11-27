@@ -83,6 +83,8 @@ class _ToolAcc:
     call_id: str = ""
     name: str = ""
     arguments_parts: list[str] = field(default_factory=list)
+    signature_parts: list[str] = field(default_factory=list)
+    block_index: int = 0
 
 
 class AgentRunner:
@@ -117,13 +119,15 @@ class AgentRunner:
         reasoning_parts: list[str] = []
         signature_parts: list[str] = []
         text_parts: list[str] = []
+        text_signatures: list[str] = []
         tool_calls: dict[int, _ToolAcc] = {}
         usage = TokenUsage()
         finish_reason: str | None = None
         reasoning_started: int | None = None
+        signature_protocol: WireProtocol | None = None
 
         async def flush_reasoning() -> None:
-            nonlocal reasoning_started
+            nonlocal reasoning_started, signature_protocol
             if reasoning_parts or signature_parts:
                 duration = (
                     max(0, (monotonic_ns() - reasoning_started) // 1_000_000)
@@ -136,10 +140,12 @@ class AgentRunner:
                         text="".join(reasoning_parts),
                         signature="".join(signature_parts) if signature_parts else None,
                         duration_ms=duration,
+                        signature_protocol=signature_protocol,
                     )
                 )
                 reasoning_parts.clear()
                 signature_parts.clear()
+                signature_protocol = None
                 reasoning_started = None
                 with self.db.transaction() as conn:
                     conn.execute(
@@ -151,9 +157,12 @@ class AgentRunner:
                 )
 
         def flush_text() -> None:
-            if text_parts:
-                blocks.append(TextBlock("".join(text_parts)))
+            if text_parts or text_signatures:
+                blocks.append(
+                    TextBlock("".join(text_parts), signature="".join(text_signatures) or None)
+                )
                 text_parts.clear()
+                text_signatures.clear()
 
         try:
             async for event in self.llm_client.stream(endpoint, request):
@@ -162,6 +171,8 @@ class AgentRunner:
 
                 if isinstance(event, ReasoningDeltaEvent):
                     flush_text()
+                    if event.part_start:
+                        await flush_reasoning()
                     if reasoning_started is None:
                         reasoning_started = monotonic_ns()
                     if event.delta:
@@ -178,21 +189,32 @@ class AgentRunner:
                         )
                     if event.signature_delta:
                         signature_parts.append(event.signature_delta)
+                    if event.signature_protocol is not None:
+                        signature_protocol = event.signature_protocol
                 elif isinstance(event, TextDeltaEvent):
                     await flush_reasoning()
+                    if event.part_start:
+                        flush_text()
                     if event.delta:
                         text_parts.append(event.delta)
                         await emit_event(sink, AgentTextDeltaEvent(run_id, event.delta))
+                    if event.signature_delta:
+                        text_signatures.append(event.signature_delta)
                 elif isinstance(event, ToolCallDeltaEvent):
                     await flush_reasoning()
                     flush_text()
-                    acc = tool_calls.setdefault(event.index, _ToolAcc())
+                    if event.index not in tool_calls:
+                        tool_calls[event.index] = _ToolAcc(block_index=len(blocks))
+                        blocks.append(ToolCallBlock("", "", ""))
+                    acc = tool_calls[event.index]
                     if event.call_id and not acc.call_id:
                         acc.call_id = event.call_id
                     if event.name and not acc.name:
                         acc.name = event.name
                     if event.arguments_delta:
                         acc.arguments_parts.append(event.arguments_delta)
+                    if event.signature_delta:
+                        acc.signature_parts.append(event.signature_delta)
                 elif isinstance(event, UsageEvent):
                     usage = event.usage
                 elif isinstance(event, DoneEvent):
@@ -203,12 +225,11 @@ class AgentRunner:
         flush_text()
         for idx in sorted(tool_calls):
             acc = tool_calls[idx]
-            blocks.append(
-                ToolCallBlock(
-                    call_id=acc.call_id,
-                    name=acc.name,
-                    arguments_json="".join(acc.arguments_parts),
-                )
+            blocks[acc.block_index] = ToolCallBlock(
+                call_id=acc.call_id,
+                name=acc.name,
+                arguments_json="".join(acc.arguments_parts),
+                signature="".join(acc.signature_parts) or None,
             )
 
         return GenerateResponse(

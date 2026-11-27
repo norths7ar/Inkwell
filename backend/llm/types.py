@@ -18,6 +18,7 @@ class WireProtocol(StrEnum):
 class AuthStyle(StrEnum):
     BEARER = "bearer"
     X_API_KEY = "x-api-key"
+    X_GOOG_API_KEY = "x-goog-api-key"
     NONE = "none"
 
 
@@ -31,6 +32,7 @@ class Role(StrEnum):
 @dataclass(frozen=True, slots=True)
 class TextBlock:
     text: str
+    signature: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +40,7 @@ class ReasoningBlock:
     text: str
     signature: str | None = None
     duration_ms: int | None = None
+    signature_protocol: WireProtocol | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +48,7 @@ class ToolCallBlock:
     call_id: str
     name: str
     arguments_json: str
+    signature: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,12 +127,16 @@ class GenerateRequest:
 @dataclass(frozen=True, slots=True)
 class TextDeltaEvent:
     delta: str
+    signature_delta: str | None = None
+    part_start: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class ReasoningDeltaEvent:
     delta: str
     signature_delta: str | None = None
+    part_start: bool = False
+    signature_protocol: WireProtocol | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +145,7 @@ class ToolCallDeltaEvent:
     call_id: str | None = None
     name: str | None = None
     arguments_delta: str = ""
+    signature_delta: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

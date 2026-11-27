@@ -19,6 +19,14 @@ class ProviderPreset:
 
 
 PRESETS: dict[str, ProviderPreset] = {
+    "gemini": ProviderPreset(
+        id="gemini",
+        name="Google Gemini",
+        base_url="https://generativelanguage.googleapis.com/v1beta",
+        default_protocol=WireProtocol.GOOGLE_GENAI,
+        auth_style=AuthStyle.X_GOOG_API_KEY,
+        discovery_url="https://generativelanguage.googleapis.com/v1beta/models",
+    ),
     "openai": ProviderPreset(
         id="openai",
         name="OpenAI",

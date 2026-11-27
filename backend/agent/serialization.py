@@ -21,27 +21,36 @@ from backend.llm.types import (
     TextBlock,
     ToolCallBlock,
     ToolResultBlock,
+    WireProtocol,
 )
 from backend.storage.models import Message, MessageRole
 
 
 def _encode_block(block: ContentBlock) -> JsonObject:
     if isinstance(block, TextBlock):
-        return {"type": "text", "text": block.text}
+        text_obj: JsonObject = {"type": "text", "text": block.text}
+        if block.signature is not None:
+            text_obj["signature"] = block.signature
+        return text_obj
     if isinstance(block, ReasoningBlock):
         obj: JsonObject = {"type": "reasoning", "text": block.text}
         if block.signature is not None:
             obj["signature"] = block.signature
         if block.duration_ms is not None:
             obj["duration_ms"] = block.duration_ms
+        if block.signature_protocol is not None:
+            obj["signature_protocol"] = block.signature_protocol.value
         return obj
     if isinstance(block, ToolCallBlock):
-        return {
+        call_obj: JsonObject = {
             "type": "tool_call",
             "call_id": block.call_id,
             "name": block.name,
             "arguments_json": block.arguments_json,
         }
+        if block.signature is not None:
+            call_obj["signature"] = block.signature
+        return call_obj
     if isinstance(block, ToolResultBlock):
         return {
             "type": "tool_result",
@@ -67,8 +76,9 @@ def serialize_blocks(blocks: tuple[ContentBlock, ...]) -> str:
 def _decode_block(obj: JsonObject) -> ContentBlock | None:
     kind = get_str(obj, "type")
     if kind == "text":
-        return TextBlock(text=get_str(obj, "text") or "")
+        return TextBlock(text=get_str(obj, "text") or "", signature=get_str(obj, "signature"))
     if kind == "reasoning":
+        protocol = get_str(obj, "signature_protocol")
         duration = obj.get("duration_ms")
         return ReasoningBlock(
             text=get_str(obj, "text") or "",
@@ -76,12 +86,14 @@ def _decode_block(obj: JsonObject) -> ContentBlock | None:
             duration_ms=duration
             if isinstance(duration, int) and not isinstance(duration, bool)
             else None,
+            signature_protocol=WireProtocol(protocol) if protocol in WireProtocol else None,
         )
     if kind == "tool_call":
         return ToolCallBlock(
             call_id=get_str(obj, "call_id") or "",
             name=get_str(obj, "name") or "",
             arguments_json=get_str(obj, "arguments_json") or "{}",
+            signature=get_str(obj, "signature"),
         )
     if kind == "tool_result":
         raw_err = obj.get("is_error")
