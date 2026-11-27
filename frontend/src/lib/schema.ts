@@ -185,6 +185,33 @@ export const discoveredSchema = z.object({
   model_id: z.string(),
   display_name: z.string(),
   owned_by: z.string(),
+  context_window: z.number().nullable().default(null),
+  max_output_tokens: z.number().nullable().default(null),
+  recommended_protocol: protocolSchema.nullable().default(null),
+  supported: z.boolean().default(true),
+  unsupported_reason: z.string().default(""),
+  catalog_match: z.enum(["none", "provider", "cross_provider"]).default("none"),
+  catalog_provider: z.string().nullable().default(null),
+  catalog_stale: z.boolean().default(false),
+});
+export const catalogStatusSchema = z.object({
+  cached: z.boolean(),
+  fetched_at: z.string().nullable(),
+  stale: z.boolean(),
+  stale_after_days: z.number(),
+  provider_count: z.number(),
+  model_count: z.number(),
+  source: z.string().default("models.dev"),
+});
+export const catalogLookupSchema = z.object({
+  found: z.boolean(),
+  display_name: z.string().default(""),
+  context_window: z.number().nullable().default(null),
+  max_output_tokens: z.number().nullable().default(null),
+  recommended_protocol: protocolSchema.nullable().default(null),
+  match_scope: z.enum(["none", "provider", "cross_provider"]).default("none"),
+  source_provider: z.string().nullable().default(null),
+  stale: z.boolean().default(false),
 });
 export const searchSchema = z.object({
   target_type: z.enum(["chapter", "entry"]),
@@ -279,6 +306,8 @@ export type BackupRecord = z.infer<typeof backupRecordSchema>;
 export type SystemStatus = z.infer<typeof systemStatusSchema>;
 export type Provider = z.infer<typeof providerSchema>;
 export type Model = z.infer<typeof modelSchema>;
+export type CatalogStatus = z.infer<typeof catalogStatusSchema>;
+export type CatalogLookup = z.infer<typeof catalogLookupSchema>;
 export type Mode = z.infer<typeof modeSchema>;
 export type Visibility = z.infer<typeof visibilitySchema>;
 export type Protocol = z.infer<typeof protocolSchema>;

@@ -175,3 +175,11 @@ class DiscoveredModel:
     model_id: str
     display_name: str
     owned_by: str = ""
+    context_window: int | None = None
+    max_output_tokens: int | None = None
+    recommended_protocol: WireProtocol | None = None
+    supported: bool = True
+    unsupported_reason: str = ""
+    catalog_match: str = "none"
+    catalog_provider: str | None = None
+    catalog_stale: bool = False

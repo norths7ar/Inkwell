@@ -11,6 +11,7 @@ from backend.agent.context import GLOBAL_RULES_SETTING_KEY
 from backend.agent.prompts import DEFAULT_MODE_PROMPTS, mode_prompt_setting_key, resolve_mode_prompt
 from backend.api.content import Input, required, supplied
 from backend.api.runtime import ApiRuntime
+from backend.llm.catalog import CatalogStatus, ModelCatalogCache
 from backend.llm.presets import PRESETS, ProviderPreset, build_endpoint_from_preset
 from backend.llm.types import DiscoveredModel, WireProtocol
 from backend.storage.migrations import ensure_transaction
@@ -93,6 +94,17 @@ class PromptView(Input):
     mode: SessionMode
     markdown: str
     default_markdown: str
+
+
+class CatalogLookupView(Input):
+    found: bool
+    display_name: str = ""
+    context_window: int | None = None
+    max_output_tokens: int | None = None
+    recommended_protocol: ProtocolName | None = None
+    match_scope: str = "none"
+    source_provider: str | None = None
+    stale: bool = False
 
 
 def create_router(runtime: ApiRuntime) -> APIRouter:
@@ -185,7 +197,44 @@ def create_router(runtime: ApiRuntime) -> APIRouter:
     async def discover(provider_id: str) -> list[DiscoveredModel]:
         provider = required(config.get_provider(runtime.conn, provider_id))
         # Discovery is a preview: importing models is an explicit POST so overrides survive.
-        return await runtime.llm.list_models(runtime.endpoint(provider))
+        endpoint = runtime.endpoint(provider)
+        discovered = await runtime.llm.list_models(endpoint)
+        catalog = ModelCatalogCache(runtime.config.catalog_path)
+        return catalog.enrich_discovered(provider.preset, discovered)
+
+    @router.get("/model-catalog")
+    async def model_catalog_status() -> CatalogStatus:
+        return ModelCatalogCache(runtime.config.catalog_path).status()
+
+    @router.post("/model-catalog/refresh")
+    async def refresh_model_catalog() -> CatalogStatus:
+        status = await ModelCatalogCache(runtime.config.catalog_path).refresh(
+            runtime.llm.http_client
+        )
+        changed("model_catalog")
+        return status
+
+    @router.get("/model-catalog/lookup")
+    async def lookup_model_catalog(
+        model_id: str,
+        preset: str = "",
+    ) -> CatalogLookupView:
+        entry = ModelCatalogCache(runtime.config.catalog_path).lookup(preset, model_id)
+        if entry is None:
+            return CatalogLookupView(found=False)
+        recommended: ProtocolName | None = None
+        if entry.match_scope == "provider" and entry.protocol is not None:
+            recommended = ProtocolName(entry.protocol.value)
+        return CatalogLookupView(
+            found=True,
+            display_name=entry.display_name,
+            context_window=entry.context_window,
+            max_output_tokens=entry.max_output_tokens,
+            recommended_protocol=recommended,
+            match_scope=entry.match_scope,
+            source_provider=entry.source_provider,
+            stale=entry.stale,
+        )
 
     @router.get("/models")
     async def models(provider_id: str | None = None) -> list[ModelRecord]:

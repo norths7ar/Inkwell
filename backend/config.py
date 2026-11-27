@@ -38,6 +38,10 @@ class AppConfig:
     def key_path(self) -> Path:
         return self.data_dir / "secret.key"
 
+    @property
+    def catalog_path(self) -> Path:
+        return self.data_dir / "model-catalog.json"
+
     def ensure_data_dirs(self) -> None:
         """Create the writable data directory tree if missing."""
         for directory in (

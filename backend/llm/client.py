@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from types import TracebackType
 
 import httpx
 
-from backend.llm._json import JsonObject, as_list, as_object, get_str, parse_json_object
+from backend.llm._json import (
+    JsonObject,
+    JsonValue,
+    as_list,
+    as_object,
+    get_int,
+    get_str,
+    parse_json_object,
+)
 from backend.llm.errors import (
     ErrorCategory,
     LLMError,
@@ -101,6 +110,11 @@ class LLMClient:
     async def aclose(self) -> None:
         if self._owns_client:
             await self._client.aclose()
+
+    @property
+    def http_client(self) -> httpx.AsyncClient:
+        """Expose the shared httpx client for auxiliary metadata requests."""
+        return self._client
 
     async def stream(
         self,
@@ -263,22 +277,43 @@ class LLMClient:
 
         items = as_list(payload.get("data")) or as_list(payload.get("models")) or []
         models: list[DiscoveredModel] = []
+        seen: set[str] = set()
         for item in items:
             obj = as_object(item)
             if obj is None:
                 continue
-            model_id = get_str(obj, "id") or get_str(obj, "name")
-            if not model_id:
+            raw_id = get_str(obj, "id") or get_str(obj, "name")
+            if not raw_id:
                 continue
-            display_name = get_str(obj, "display_name") or get_str(obj, "name") or model_id
+            model_id = raw_id.removeprefix("models/").strip()
+            if not model_id or model_id in seen:
+                continue
+            seen.add(model_id)
+            display_name = (
+                get_str(obj, "display_name")
+                or get_str(obj, "displayName")
+                or (get_str(obj, "name") if get_str(obj, "id") else None)
+                or model_id
+            )
             owned_by = get_str(obj, "owned_by") or ""
+            context_window, max_output_tokens = _extract_model_limits(obj)
+            disclosed_protocol, protocol_error = _extract_disclosed_protocol(obj)
+            supported, unsupported_reason = _classify_model_support(model_id, obj)
+            if protocol_error:
+                supported, unsupported_reason = False, protocol_error
             models.append(
                 DiscoveredModel(
                     model_id=model_id,
                     display_name=display_name,
                     owned_by=owned_by,
+                    context_window=context_window,
+                    max_output_tokens=max_output_tokens,
+                    recommended_protocol=disclosed_protocol,
+                    supported=supported,
+                    unsupported_reason=unsupported_reason,
                 )
             )
+        models.sort(key=lambda item: not item.supported)
         return models
 
     async def _list_google_models(self, endpoint: EndpointConfig) -> list[DiscoveredModel]:
@@ -310,9 +345,14 @@ class LLMClient:
                 name = get_str(model, "name")
                 if name and "generateContent" in methods:
                     model_id = name.removeprefix("models/")
+                    context_window, max_output_tokens = _extract_model_limits(model)
                     models.append(
                         DiscoveredModel(
-                            model_id, get_str(model, "displayName") or model_id, "google"
+                            model_id=model_id,
+                            display_name=get_str(model, "displayName") or model_id,
+                            owned_by="google",
+                            context_window=context_window,
+                            max_output_tokens=max_output_tokens,
                         )
                     )
             token = get_str(payload, "nextPageToken")
@@ -322,3 +362,86 @@ class LLMClient:
                 raise LLMError(ErrorCategory.PROTOCOL, "Repeated Gemini model-list page token")
             seen_tokens.add(token)
             url = url.copy_set_param("pageToken", token)
+
+
+_AUDIO_MODEL_RE = re.compile(
+    r"^(?:tts-|whisper-|gpt-live-transcribe(?:-|$)"
+    r"|(?:gpt-\d[^/]*|gpt)-(?:audio|realtime|transcribe|tts)(?:-|$)"
+    r"|mimo-(?:v\d+(?:\.\d+)*-)?(?:asr|tts)(?:-|$))",
+    re.IGNORECASE,
+)
+_NON_CHAT_MODEL_RE = re.compile(
+    r"^(?:(?:chatgpt|gpt)-image(?:-|$)|gpt-live(?:-|$)|dall-e-"
+    r"|text-embedding-|(?:omni|text)-moderation-)",
+    re.IGNORECASE,
+)
+_GPT_LIVE_RE = re.compile(r"^gpt-live-(?!transcribe)", re.IGNORECASE)
+
+
+def _positive(value: JsonValue | None) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value > 0 else None
+
+
+def _extract_model_limits(obj: JsonObject) -> tuple[int | None, int | None]:
+    """Extract context_window and max_output_tokens from common provider listing formats."""
+    limit_obj = as_object(obj.get("limit"))
+    top_provider = as_object(obj.get("top_provider"))
+    context_window = (
+        _positive(limit_obj.get("context") if limit_obj else None)
+        or _positive(obj.get("context_window"))
+        or _positive(obj.get("contextWindow"))
+        or _positive(obj.get("context_length"))
+        or _positive(obj.get("inputTokenLimit"))
+        or (get_int(top_provider, "context_length") if top_provider else None)
+    )
+    max_output = (
+        _positive(limit_obj.get("output") if limit_obj else None)
+        or _positive(obj.get("max_output_tokens"))
+        or _positive(obj.get("maxTokens"))
+        or _positive(obj.get("outputTokenLimit"))
+        or _positive(top_provider.get("max_completion_tokens") if top_provider else None)
+    )
+    return (
+        context_window if context_window and context_window > 0 else None,
+        max_output if max_output and max_output > 0 else None,
+    )
+
+
+def _extract_disclosed_protocol(obj: JsonObject) -> tuple[WireProtocol | None, str]:
+    """Honor an explicit wire protocol disclosed directly by the provider's /models response."""
+    raw = (get_str(obj, "protocol") or get_str(obj, "api") or "").strip().lower()
+    if not raw:
+        return None, ""
+    mapping = {
+        "openai-chat": WireProtocol.OPENAI_CHAT,
+        "openai-completions": WireProtocol.OPENAI_CHAT,
+        "openai-responses": WireProtocol.OPENAI_RESPONSES,
+        "anthropic-messages": WireProtocol.ANTHROPIC_MESSAGES,
+        "google-genai": WireProtocol.GOOGLE_GENAI,
+        "google-generative-ai": WireProtocol.GOOGLE_GENAI,
+    }
+    protocol = mapping.get(raw)
+    if protocol is None:
+        return None, f"服务端声明了不支持的协议：{raw[:200]}"
+    return protocol, ""
+
+
+def _classify_model_support(model_id: str, obj: JsonObject) -> tuple[bool, str]:
+    raw_type = (get_str(obj, "type") or "").strip().lower()
+    methods = as_list(obj.get("supportedGenerationMethods"))
+    is_audio = raw_type in ("asr", "tts", "speech", "audio") or bool(
+        _AUDIO_MODEL_RE.search(model_id)
+    )
+    unsupported = (
+        (bool(raw_type) and raw_type not in ("chat", "text", "language", "model"))
+        or is_audio
+        or bool(_NON_CHAT_MODEL_RE.search(model_id))
+        or (methods is not None and "generateContent" not in methods)
+    )
+    if not unsupported:
+        return True, ""
+    if _GPT_LIVE_RE.search(model_id):
+        return False, "此型号的实时接口尚未适配"
+    return False, "非对话模型，不支持接入"

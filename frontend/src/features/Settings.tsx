@@ -43,6 +43,8 @@ import {
 import {
   backupRecordSchema,
   bookSchema,
+  catalogLookupSchema,
+  catalogStatusSchema,
   discoveredSchema,
   modelSchema,
   presetSchema,
@@ -53,6 +55,7 @@ import {
   systemStatusSchema,
   type BackupRecord,
   type Book,
+  type CatalogStatus,
   type Model,
   type Provider,
   type SystemStatus,
@@ -778,6 +781,25 @@ function ProviderEditor({
   );
 }
 
+function formatCatalogDate(iso: string | null): string {
+  if (!iso) return "";
+  const ts = Date.parse(iso);
+  if (Number.isNaN(ts)) return "";
+  return new Date(ts).toLocaleDateString("zh-CN");
+}
+
+function formatCompactTokens(value: number): string {
+  if (value >= 1_000_000) {
+    const m = value / 1_000_000;
+    return `${Number.isInteger(m) ? m : m.toFixed(1)}M`;
+  }
+  if (value >= 1_000) {
+    const k = value / 1_000;
+    return `${Number.isInteger(k) ? k : k.toFixed(0)}K`;
+  }
+  return String(value);
+}
+
 function ModelsSection({
   providers,
   models,
@@ -795,11 +817,73 @@ function ModelsSection({
   onModelSaved: (model: Model) => void;
   onModelDeleted: (id: string) => void;
 }) {
+  const [catalogStatus, setCatalogStatus] = useState<CatalogStatus | null>(null);
+  const [catalogBusy, setCatalogBusy] = useState(false);
+  const [catalogError, setCatalogError] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    void request("/model-catalog", catalogStatusSchema)
+      .then((status) => {
+        if (active) setCatalogStatus(status);
+      })
+      .catch(() => {
+        /* Optional catalog status. */
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  async function refreshCatalog(): Promise<CatalogStatus | null> {
+    setCatalogBusy(true);
+    setCatalogError("");
+    try {
+      const next = await request("/model-catalog/refresh", catalogStatusSchema, {
+        method: "POST",
+      });
+      setCatalogStatus(next);
+      return next;
+    } catch (failure) {
+      setCatalogError(errorText(failure));
+      return null;
+    } finally {
+      setCatalogBusy(false);
+    }
+  }
+
+  const catalogNeedsUpdate = Boolean(
+    catalogStatus && (!catalogStatus.cached || catalogStatus.stale),
+  );
+
   return (
     <div className="settings-sections">
       {settings && (
         <DefaultModelsBlock initial={settings} models={enabledModels} onSaved={onSettingsSaved} />
       )}
+      {catalogStatus && (
+        <div className={`catalog-status-bar ${catalogNeedsUpdate ? "is-stale" : ""}`}>
+          <div className="catalog-status-text">
+            <strong>模型元信息缓存</strong>
+            <span>
+              {!catalogStatus.cached
+                ? "尚未同步；联网更新后，导入模型时可自动预填上下文窗口、输出上限与推荐协议。"
+                : catalogStatus.stale
+                  ? `已缓存 ${catalogStatus.model_count} 个模型（更新于 ${formatCatalogDate(catalogStatus.fetched_at)}，已超过 ${catalogStatus.stale_after_days} 天，建议更新）`
+                  : `已缓存 ${catalogStatus.model_count} 个模型 · 更新于 ${formatCatalogDate(catalogStatus.fetched_at)}（${catalogStatus.source}）`}
+            </span>
+          </div>
+          <Button
+            variant={catalogNeedsUpdate ? "primary" : "secondary"}
+            disabled={catalogBusy}
+            onClick={() => void refreshCatalog()}
+          >
+            <RefreshCw size={14} />
+            {catalogBusy ? "更新中…" : catalogStatus.cached ? "更新目录" : "同步目录"}
+          </Button>
+        </div>
+      )}
+      <Alert>{catalogError}</Alert>
       <hr className="settings-divider" />
       {providers.length === 0 ? (
         <EmptyState title="尚未配置提供商">
@@ -813,6 +897,9 @@ function ModelsSection({
               <ProviderModelsBlock
                 provider={provider}
                 models={models.filter((item) => item.provider_id === provider.id)}
+                catalogStatus={catalogStatus}
+                catalogBusy={catalogBusy}
+                onRefreshCatalog={refreshCatalog}
                 onSaved={onModelSaved}
                 onDeleted={onModelDeleted}
               />
@@ -917,11 +1004,17 @@ function DefaultModelsBlock({
 function ProviderModelsBlock({
   provider,
   models,
+  catalogStatus,
+  catalogBusy,
+  onRefreshCatalog,
   onSaved,
   onDeleted,
 }: {
   provider: Provider;
   models: Model[];
+  catalogStatus: CatalogStatus | null;
+  catalogBusy: boolean;
+  onRefreshCatalog: () => Promise<CatalogStatus | null>;
   onSaved: (model: Model) => void;
   onDeleted: (id: string) => void;
 }) {
@@ -956,6 +1049,7 @@ function ProviderModelsBlock({
     try {
       for (const model of discovered ?? []) {
         if (
+          !model.supported ||
           !selected.includes(model.model_id) ||
           models.some((item) => item.model_id === model.model_id)
         ) {
@@ -963,7 +1057,13 @@ function ProviderModelsBlock({
         }
         const saved = await request(`/providers/${provider.id}/models`, modelSchema, {
           method: "POST",
-          body: { model_id: model.model_id, display_name: model.display_name },
+          body: {
+            model_id: model.model_id,
+            display_name: model.display_name,
+            protocol_override: model.recommended_protocol,
+            context_window: model.context_window,
+            max_output_tokens: model.max_output_tokens,
+          },
         });
         onSaved(saved);
       }
@@ -1103,6 +1203,27 @@ function ProviderModelsBlock({
         title={`发现模型 · ${provider.name}`}
       >
         <div className="stack">
+          {catalogStatus && (!catalogStatus.cached || catalogStatus.stale) && (
+            <div className="discovery-catalog-hint">
+              <span>
+                {!catalogStatus.cached
+                  ? "同步模型元信息缓存后，可自动预填上下文窗口与推荐协议。"
+                  : "本地模型元信息缓存已过期，建议更新后再导入。"}
+              </span>
+              <Button
+                variant="ghost"
+                disabled={busy || catalogBusy}
+                onClick={() => {
+                  void onRefreshCatalog().then((next) => {
+                    if (next) void discover();
+                  });
+                }}
+              >
+                <RefreshCw size={12} />
+                {catalogBusy ? "更新中…" : catalogStatus.cached ? "更新并刷新" : "立即同步"}
+              </Button>
+            </div>
+          )}
           <Input
             placeholder="筛选模型 ID 或名称…"
             aria-label="筛选发现的模型"
@@ -1118,7 +1239,11 @@ function ProviderModelsBlock({
                 onClick={() =>
                   setSelected(
                     (discovered ?? [])
-                      .filter((model) => !models.some((item) => item.model_id === model.model_id))
+                      .filter(
+                        (model) =>
+                          model.supported &&
+                          !models.some((item) => item.model_id === model.model_id),
+                      )
                       .map((model) => model.model_id),
                   )
                 }
@@ -1134,12 +1259,27 @@ function ProviderModelsBlock({
             {filteredDiscovered.map((model) => {
               const exists = models.some((item) => item.model_id === model.model_id);
               const checked = selected.includes(model.model_id);
+              const metaParts = [model.model_id];
+              if (model.context_window) {
+                metaParts.push(`${formatCompactTokens(model.context_window)} ctx`);
+              }
+              if (model.max_output_tokens) {
+                metaParts.push(`${formatCompactTokens(model.max_output_tokens)} out`);
+              }
+              if (model.catalog_match === "cross_provider" && model.catalog_provider) {
+                metaParts.push(
+                  `参考 ${model.catalog_provider}${model.catalog_stale ? "（缓存已过期）" : ""}`,
+                );
+              } else if (model.catalog_match === "provider" && model.catalog_stale) {
+                metaParts.push("缓存已过期");
+              }
               return (
                 <button
                   type="button"
                   key={model.model_id}
-                  disabled={exists || busy}
+                  disabled={exists || !model.supported || busy}
                   className={`discovery-pick-item ${checked ? "is-checked" : ""}`}
+                  title={!model.supported ? model.unsupported_reason || "不支持接入" : undefined}
                   onClick={() =>
                     setSelected((items) =>
                       items.includes(model.model_id)
@@ -1153,9 +1293,13 @@ function ProviderModelsBlock({
                   </span>
                   <div className="discovery-pick-text">
                     <strong>{model.display_name || model.model_id}</strong>
-                    <span>{model.model_id}</span>
+                    <span>{metaParts.join(" · ")}</span>
                   </div>
-                  {exists && <Badge>已导入</Badge>}
+                  <div className="discovery-pick-badges">
+                    {model.recommended_protocol && <Badge>{model.recommended_protocol}</Badge>}
+                    {!model.supported && <Badge tone="warning">不支持接入</Badge>}
+                    {exists && <Badge>已导入</Badge>}
+                  </div>
                 </button>
               );
             })}
@@ -1187,6 +1331,8 @@ function ProviderModelsBlock({
         {editing !== null && (
           <ModelEditor
             providerId={provider.id}
+            providerPreset={provider.preset}
+            catalogCached={Boolean(catalogStatus?.cached)}
             initial={editing === "new" ? undefined : editing}
             onSaved={(model) => {
               onSaved(model);
@@ -1226,11 +1372,15 @@ function optionalPositive(value: string): number | null {
 
 function ModelEditor({
   providerId,
+  providerPreset,
+  catalogCached,
   initial,
   onSaved,
   onCancel,
 }: {
   providerId: string;
+  providerPreset: string;
+  catalogCached: boolean;
   initial?: Model;
   onSaved: (model: Model) => void;
   onCancel: () => void;
@@ -1238,11 +1388,59 @@ function ModelEditor({
   const [modelId, setModelId] = useState(initial?.model_id ?? "");
   const [displayName, setDisplayName] = useState(initial?.display_name ?? "");
   const [protocol, setProtocol] = useState(initial?.protocol_override ?? "inherit");
+  const protocolChosen = useRef(initial !== undefined);
+  const modelIdRef = useRef(initial?.model_id ?? "");
   const [context, setContext] = useState(initial?.context_window?.toString() ?? "");
   const [output, setOutput] = useState(initial?.max_output_tokens?.toString() ?? "");
   const [enabled, setEnabled] = useState(initial?.enabled ?? true);
   const [busy, setBusy] = useState(false);
+  const [lookupBusy, setLookupBusy] = useState(false);
+  const [lookupNote, setLookupNote] = useState("");
   const [error, setError] = useState("");
+
+  async function fillFromCatalog() {
+    const trimmed = modelId.trim();
+    if (!trimmed || lookupBusy) return;
+    setLookupBusy(true);
+    setLookupNote("");
+    try {
+      const params = new URLSearchParams({
+        model_id: trimmed,
+        preset: providerPreset,
+      });
+      const result = await request(
+        `/model-catalog/lookup?${params.toString()}`,
+        catalogLookupSchema,
+      );
+      if (modelIdRef.current.trim() !== trimmed) return;
+      if (!result.found) {
+        setLookupNote("本地缓存未收录此型号，可手动填写或先更新目录。");
+        return;
+      }
+      if (result.display_name)
+        setDisplayName((current) => (current.trim() ? current : result.display_name));
+      if (result.context_window)
+        setContext((current) => (current.trim() ? current : String(result.context_window)));
+      if (result.max_output_tokens)
+        setOutput((current) => (current.trim() ? current : String(result.max_output_tokens)));
+      if (!protocolChosen.current && result.recommended_protocol) {
+        setProtocol(result.recommended_protocol);
+      }
+      const sourceLabel =
+        result.match_scope === "cross_provider"
+          ? `（跨提供商参考：${result.source_provider ?? "目录"}，未覆盖协议）`
+          : result.source_provider
+            ? `（来源：${result.source_provider}）`
+            : "";
+      setLookupNote(
+        `已从本地缓存补全空缺字段${sourceLabel}${result.stale ? "，缓存已过期建议更新" : ""}。`,
+      );
+    } catch (failure) {
+      setLookupNote(errorText(failure));
+    } finally {
+      setLookupBusy(false);
+    }
+  }
 
   async function save(event: FormEvent) {
     event.preventDefault();
@@ -1279,13 +1477,29 @@ function ModelEditor({
   return (
     <form className="model-form" onSubmit={(event) => void save(event)}>
       <div className="stack model-form-scroll">
-        <Input
-          label="模型 ID"
-          value={modelId}
-          disabled={!!initial}
-          onChange={(event) => setModelId(event.target.value)}
-          required
-        />
+        <div className="model-id-row">
+          <Input
+            label="模型 ID"
+            value={modelId}
+            disabled={!!initial}
+            onChange={(event) => {
+              modelIdRef.current = event.target.value;
+              if (!protocolChosen.current) setProtocol("inherit");
+              setModelId(event.target.value);
+              setLookupNote("");
+            }}
+            required
+          />
+          {catalogCached && (
+            <Button
+              disabled={busy || lookupBusy || !modelId.trim()}
+              onClick={() => void fillFromCatalog()}
+            >
+              {lookupBusy ? "查询中…" : "从缓存补全"}
+            </Button>
+          )}
+        </div>
+        {lookupNote && <p className="muted">{lookupNote}</p>}
         <Input
           label="显示名称"
           value={displayName}
@@ -1294,7 +1508,10 @@ function ModelEditor({
         <Select
           label="单模型协议覆盖"
           value={protocol}
-          onChange={setProtocol}
+          onChange={(value) => {
+            protocolChosen.current = true;
+            setProtocol(value);
+          }}
           options={[{ value: "inherit", label: "继承提供商默认协议" }, ...protocols]}
         />
         <div className="settings-grid-2">
