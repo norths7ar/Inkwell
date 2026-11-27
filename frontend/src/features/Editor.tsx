@@ -8,7 +8,15 @@ import {
   type ReactNode,
 } from "react";
 import { z } from "zod";
-import { Eye, FileCode2, FileText, History, RotateCcw, Save } from "lucide-react";
+import {
+  Eye,
+  FileCode2,
+  FileText,
+  History,
+  MessageSquareQuote,
+  RotateCcw,
+  Save,
+} from "lucide-react";
 import { Alert, Button, Dialog, Input, Textarea } from "../components/ui";
 import { Markdown } from "../components/Markdown";
 import { errorText } from "../lib/api";
@@ -36,6 +44,7 @@ export function Editor({
   kind,
   onSave,
   onHistory,
+  onQuoteSelection,
   ref,
   toolbarStart,
   toolbarEnd,
@@ -47,6 +56,11 @@ export function Editor({
   kind: string;
   onSave: (value: DocumentValue, baseline: DocumentValue) => Promise<void>;
   onHistory?: () => void;
+  onQuoteSelection?: (payload: {
+    selectedText: string;
+    startLine: number;
+    endLine: number;
+  }) => void;
   ref?: Ref<EditorHandle>;
   toolbarStart?: ReactNode;
   toolbarEnd?: ReactNode;
@@ -73,6 +87,7 @@ export function Editor({
   const [busy, setBusy] = useState(false);
   const [reloadOpen, setReloadOpen] = useState(false);
   const [preview, setPreview] = useState(false);
+  const [hasSelection, setHasSelection] = useState(false);
   const dirty = !equal(form, baseline);
   const current = useRef({ form, baseline, dirty });
   const titleInputRef = useRef<HTMLInputElement>(null);
@@ -224,7 +239,51 @@ export function Editor({
     });
   }
 
+  const syncSelectionState = useCallback(() => {
+    const el = textareaRef.current;
+    if (!el || preview) {
+      setHasSelection(false);
+      return;
+    }
+    const start = el.selectionStart ?? 0;
+    const end = el.selectionEnd ?? 0;
+    setHasSelection(form.content.slice(start, end).trim().length > 0);
+  }, [form.content, preview]);
+
+  useEffect(() => {
+    if (preview) setHasSelection(false);
+  }, [preview]);
+
+  const quoteCurrentSelection = useCallback(() => {
+    const el = textareaRef.current;
+    if (!el || preview || !onQuoteSelection) return;
+    const rawStart = el.selectionStart ?? 0;
+    const rawEnd = el.selectionEnd ?? 0;
+    if (rawEnd <= rawStart) return;
+    const rawSlice = form.content.slice(rawStart, rawEnd);
+    const leadingTrim = rawSlice.length - rawSlice.trimStart().length;
+    const trailingTrim = rawSlice.length - rawSlice.trimEnd().length;
+    const start = rawStart + leadingTrim;
+    const end = rawEnd - trailingTrim;
+    if (end <= start) return;
+    const selectedText = form.content.slice(start, end).slice(0, 12000);
+    const startLine = form.content.slice(0, start).split("\n").length;
+    const endLine = form.content.slice(0, end).split("\n").length;
+    onQuoteSelection({ selectedText, startLine, endLine });
+  }, [form.content, onQuoteSelection, preview]);
+
   function handleBodyKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (
+      (event.ctrlKey || event.metaKey) &&
+      event.shiftKey &&
+      !event.altKey &&
+      event.key.toLowerCase() === "l" &&
+      onQuoteSelection
+    ) {
+      event.preventDefault();
+      quoteCurrentSelection();
+      return;
+    }
     if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return;
     const keyName = event.key.toLowerCase();
     if (keyName === "b") {
@@ -268,6 +327,17 @@ export function Editor({
           </span>
         </div>
         <div className="row editor-actions">
+          {!preview && onQuoteSelection && hasSelection && (
+            <Button
+              variant="ghost"
+              className="icon-control"
+              aria-label="引用选中内容到对话"
+              title="引用选中内容到对话 · Ctrl+Shift+L"
+              onClick={quoteCurrentSelection}
+            >
+              <MessageSquareQuote size={16} />
+            </Button>
+          )}
           <Button
             variant="ghost"
             className={`icon-control ${preview ? "is-active" : ""}`}
@@ -361,6 +431,9 @@ export function Editor({
             disabled={busy}
             placeholder="正文"
             onKeyDown={handleBodyKeyDown}
+            onSelect={syncSelectionState}
+            onKeyUp={syncSelectionState}
+            onMouseUp={syncSelectionState}
             onChange={(event) => {
               setForm({ ...form, content: event.target.value });
               setSavedLocal(false);

@@ -68,7 +68,7 @@ import {
 } from "../lib/schema";
 import { Editor, type DocumentValue, type EditorHandle } from "./Editor";
 import { PendingPanel } from "./PendingPanel";
-import { ChatPanel } from "./ChatPanel";
+import { ChatPanel, type ExcerptReferenceInput, type FocusTarget } from "./ChatPanel";
 import { RevisionDialog } from "./RevisionDialog";
 import "./workspace.css";
 
@@ -330,6 +330,11 @@ export function Workspace({
   const [resizingCompanion, setResizingCompanion] = useState(false);
   const [sessionSidebar, setSessionSidebar] = useState<HTMLDivElement | null>(null);
   const [focusPending, setFocusPending] = useState<string | null>(null);
+  const excerptSeqRef = useRef(0);
+  const [pendingExcerpt, setPendingExcerpt] = useState<{
+    seq: number;
+    item: ExcerptReferenceInput;
+  } | null>(null);
 
   const [groupForm, setGroupForm] = useState<GroupForm | null>(null);
   const [renameForm, setRenameForm] = useState<RenameForm | null>(null);
@@ -1324,6 +1329,29 @@ export function Workspace({
   const trashTotalCount = data.trashChapters.length + data.trashEntries.length;
   const editing = route === "chapters" || isEntryRoute(route);
   const sidebarClosed = route === "shelf" || sidebarCollapsed;
+
+  const currentFocus: FocusTarget | null = useMemo(() => {
+    if (!editing || !selected) return null;
+    if (selected.kind === "chapter") {
+      const ch = data.chapters.find((item) => item.id === selected.id);
+      if (!ch) return null;
+      return {
+        targetType: "chapter",
+        targetId: ch.id,
+        title: ch.title,
+        label: "章节",
+      };
+    }
+    const en = data.entries.find((item) => item.id === selected.id);
+    if (!en) return null;
+    return {
+      targetType: "entry",
+      targetId: en.id,
+      title: en.title,
+      label: entryKindLabel(en.kind),
+      visibility: en.visibility,
+    };
+  }, [editing, selected, data.chapters, data.entries]);
 
   const sidebarToggle = (
     <Button
@@ -2445,6 +2473,24 @@ export function Workspace({
                     }
                     onSave={save}
                     onHistory={() => setHistoryOpen(true)}
+                    onQuoteSelection={({ selectedText, startLine, endLine }) => {
+                      setCompanionOpen(true);
+                      setPendingExcerpt({
+                        seq: ++excerptSeqRef.current,
+                        item: {
+                          targetType: selected.kind,
+                          targetId: selected.id,
+                          title: documentValue.title,
+                          label:
+                            selected.kind === "chapter"
+                              ? "章节"
+                              : entryKindLabel(entry?.kind ?? "note"),
+                          selectedText,
+                          startLine,
+                          endLine,
+                        },
+                      });
+                    }}
                     ref={editor}
                     active={editing}
                     autoFocusTitle={
@@ -2616,6 +2662,8 @@ export function Workspace({
               bookId={bookId}
               chapters={data.chapters}
               entries={data.entries}
+              currentFocus={currentFocus}
+              pendingExcerpt={pendingExcerpt}
               expanded={route === "discussion"}
               toolbarStart={sidebarToggle}
               sidebarTarget={sessionSidebar}

@@ -12,7 +12,12 @@ from backend.agent import events as agent_events
 from backend.agent.loop import AgentRunner
 from backend.agent.serialization import serialize_blocks
 from backend.api.events import EventBus
-from backend.api.references import EntityReference, resolve_references
+from backend.api.references import (
+    EntityReference,
+    FocusReference,
+    resolve_focus,
+    resolve_references,
+)
 from backend.config import AppConfig
 from backend.crypto import create_cipher
 from backend.errors import exception_error
@@ -206,6 +211,7 @@ class ApiRuntime:
         answer_to: str | None = None,
         reasoning_effort: str | None = None,
         references: list[EntityReference] | None = None,
+        current_focus: FocusReference | None = None,
     ) -> Run:
         session = sessions.get_session(self.conn, session_id)
         if session is None:
@@ -228,7 +234,9 @@ class ApiRuntime:
                     waiting.references_json
                 )
         references = references or []
-        snippets = resolve_references(self.conn, session, references)
+        snippets = resolve_focus(self.conn, session, current_focus) + resolve_references(
+            self.conn, session, references
+        )
         fallback_title: str | None = None
         if answer_to is None and not session.title.strip():
             fallback_title = self._fallback_session_title(text)
@@ -243,7 +251,9 @@ class ApiRuntime:
                 book_id=session.book_id,
                 model_id=model.id,
                 reasoning_effort=reasoning_effort,
-                references_json=TypeAdapter(list[EntityReference]).dump_json(references).decode(),
+                references_json=TypeAdapter(list[EntityReference])
+                .dump_json(references, exclude_none=True)
+                .decode(),
             )
             sessions.append_message(
                 self.conn,

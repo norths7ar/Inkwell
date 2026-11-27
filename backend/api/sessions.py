@@ -6,7 +6,7 @@ from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from backend.api import compaction, history
-from backend.api.references import EntityReference
+from backend.api.references import EntityReference, FocusReference
 from backend.api.runtime import ApiRuntime
 from backend.errors import safe_error
 from backend.storage.migrations import ensure_transaction
@@ -33,6 +33,7 @@ class RunInput(TextInput):
     model_id: str | None = None
     reasoning_effort: str | None = Field(default=None, max_length=64)
     references: list[EntityReference] | None = None
+    current_focus: FocusReference | None = None
 
 
 class HistoryInput(BaseModel):
@@ -223,6 +224,7 @@ def create_router(runtime: ApiRuntime) -> APIRouter:
             body.model_id,
             reasoning_effort=body.reasoning_effort,
             references=body.references,
+            current_focus=body.current_focus,
         )
 
     @router.get("/runs/{run_id}")
@@ -252,6 +254,7 @@ def create_router(runtime: ApiRuntime) -> APIRouter:
             answer_to=run_id,
             reasoning_effort=body.reasoning_effort,
             references=body.references,
+            current_focus=body.current_focus,
         )
 
     return router

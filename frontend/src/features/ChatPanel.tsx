@@ -263,11 +263,33 @@ function writeDraft(key: string, value: string) {
   }
 }
 
-type EntityReferenceItem = {
+export type FocusTarget = {
   targetType: "chapter" | "entry";
   targetId: string;
   title: string;
   label: string;
+  visibility?: Session["visibility_scope"];
+};
+
+export type ExcerptReferenceInput = {
+  targetType: "chapter" | "entry";
+  targetId: string;
+  title: string;
+  label: string;
+  selectedText: string;
+  startLine?: number;
+  endLine?: number;
+};
+
+type EntityReferenceItem = {
+  key: string;
+  targetType: "chapter" | "entry";
+  targetId: string;
+  title: string;
+  label: string;
+  selectedText?: string;
+  startLine?: number;
+  endLine?: number;
 };
 
 type ToolStep = {
@@ -760,6 +782,7 @@ function buildReferenceCandidates(
   visibilityScope: Session["visibility_scope"],
 ): EntityReferenceItem[] {
   const chapterRefs: EntityReferenceItem[] = chapters.map((chapter) => ({
+    key: `chapter:${chapter.id}`,
     targetType: "chapter",
     targetId: chapter.id,
     title: chapter.title,
@@ -768,6 +791,7 @@ function buildReferenceCandidates(
   const entryRefs: EntityReferenceItem[] = entries
     .filter((entry) => visibilityScope === "global" || entry.visibility === "local")
     .map((entry) => ({
+      key: `entry:${entry.id}`,
       targetType: "entry",
       targetId: entry.id,
       title: entry.title,
@@ -798,6 +822,8 @@ function ComposerArea({
   visibilityPermanent,
   references,
   onReferencesChange,
+  currentFocus,
+  onDismissFocus,
   candidates,
   running,
   waiting,
@@ -825,6 +851,8 @@ function ComposerArea({
   visibilityPermanent: boolean;
   references: EntityReferenceItem[];
   onReferencesChange: (refs: EntityReferenceItem[]) => void;
+  currentFocus?: FocusTarget | null;
+  onDismissFocus?: () => void;
   candidates: EntityReferenceItem[];
   running: boolean;
   waiting: boolean;
@@ -849,7 +877,10 @@ function ComposerArea({
       .filter(
         (item) =>
           !references.some(
-            (ref) => ref.targetType === item.targetType && ref.targetId === item.targetId,
+            (ref) =>
+              !ref.selectedText &&
+              ref.targetType === item.targetType &&
+              ref.targetId === item.targetId,
           ) &&
           (!q || item.title.toLowerCase().includes(q) || item.label.includes(q)),
       )
@@ -909,7 +940,7 @@ function ComposerArea({
         <div className="mention-popover" role="listbox" aria-label="引用章节或设定">
           {filteredCandidates.map((item, idx) => (
             <button
-              key={`${item.targetType}:${item.targetId}`}
+              key={item.key}
               type="button"
               role="option"
               aria-selected={idx === mentionIndex}
@@ -923,30 +954,72 @@ function ComposerArea({
         </div>
       )}
       <div className="chat-composer">
-        {references.length > 0 && (
+        {(currentFocus || references.length > 0) && (
           <div className="composer-refs" aria-label="本轮已引用资料">
-            {references.map((ref) => (
-              <span className="composer-ref-chip" key={`${ref.targetType}:${ref.targetId}`}>
-                {ref.targetType === "chapter" ? <BookOpen size={11} /> : <NotebookPen size={11} />}
+            {currentFocus && (
+              <span
+                className="composer-ref-chip is-focus"
+                title={`当前正在查看：${currentFocus.label} · ${currentFocus.title}（仅提供位置锚点，不整篇注入）`}
+              >
+                {currentFocus.targetType === "chapter" ? (
+                  <BookOpen size={11} />
+                ) : (
+                  <NotebookPen size={11} />
+                )}
                 <span>
-                  {ref.label} · {ref.title}
+                  当前：{currentFocus.label} · {currentFocus.title}
                 </span>
-                <button
-                  type="button"
-                  aria-label={`移除引用 ${ref.title}`}
-                  onClick={() =>
-                    onReferencesChange(
-                      references.filter(
-                        (item) =>
-                          !(item.targetType === ref.targetType && item.targetId === ref.targetId),
-                      ),
-                    )
+                {onDismissFocus && (
+                  <button
+                    type="button"
+                    aria-label={`移除当前焦点 ${currentFocus.title}`}
+                    onClick={onDismissFocus}
+                  >
+                    <X size={11} />
+                  </button>
+                )}
+              </span>
+            )}
+            {references.map((ref) => {
+              const rangeText =
+                ref.startLine !== undefined
+                  ? ref.endLine !== undefined && ref.endLine !== ref.startLine
+                    ? ` L${ref.startLine}-${ref.endLine}`
+                    : ` L${ref.startLine}`
+                  : ref.selectedText
+                    ? "（片段）"
+                    : "";
+              return (
+                <span
+                  className={`composer-ref-chip ${ref.selectedText ? "is-excerpt" : ""}`}
+                  key={ref.key}
+                  title={
+                    ref.selectedText
+                      ? `${ref.label} · ${ref.title}${rangeText}\n${ref.selectedText.slice(0, 160)}`
+                      : `${ref.label} · ${ref.title}`
                   }
                 >
-                  <X size={11} />
-                </button>
-              </span>
-            ))}
+                  {ref.targetType === "chapter" ? (
+                    <BookOpen size={11} />
+                  ) : (
+                    <NotebookPen size={11} />
+                  )}
+                  <span>
+                    {ref.label} · {ref.title}
+                    {rangeText}
+                  </span>
+                  <button
+                    type="button"
+                    aria-label={`移除引用 ${ref.title}`}
+                    onClick={() =>
+                      onReferencesChange(references.filter((item) => item.key !== ref.key))
+                    }
+                  >
+                    <X size={11} />
+                  </button>
+                </span>
+              );
+            })}
           </div>
         )}
         <Textarea
@@ -1116,6 +1189,20 @@ function ComposerArea({
   );
 }
 
+function serializeReferences(references: EntityReferenceItem[]) {
+  return references.map((ref) => ({
+    target_type: ref.targetType,
+    target_id: ref.targetId,
+    ...(ref.selectedText !== undefined
+      ? {
+          selected_text: ref.selectedText,
+          ...(ref.startLine !== undefined ? { start_line: ref.startLine } : {}),
+          ...(ref.endLine !== undefined ? { end_line: ref.endLine } : {}),
+        }
+      : {}),
+  }));
+}
+
 function SessionChat({
   session,
   models,
@@ -1126,6 +1213,10 @@ function SessionChat({
   onReasoningEffortChange,
   chapters,
   entries,
+  references,
+  onReferencesChange,
+  currentFocus,
+  onDismissFocus,
   initialRuns,
   onRunsChange,
   onCompactionsChange,
@@ -1143,6 +1234,10 @@ function SessionChat({
   onReasoningEffortChange: (value: string) => void;
   chapters: Chapter[];
   entries: Entry[];
+  references: EntityReferenceItem[];
+  onReferencesChange: (refs: EntityReferenceItem[]) => void;
+  currentFocus: FocusTarget | null;
+  onDismissFocus: () => void;
   initialRuns?: Run[];
   onRunsChange: (runs: Run[]) => void;
   onCompactionsChange: (compactions: Compaction[]) => void;
@@ -1157,7 +1252,6 @@ function SessionChat({
   const [live, setLive] = useState<LiveTurn>(emptyTurn);
   const [liveElapsedMs, setLiveElapsedMs] = useState(0);
   const [text, setText] = useState(() => readDraft(draftKey));
-  const [references, setReferences] = useState<EntityReferenceItem[]>([]);
   const [answer, setAnswer] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -1187,7 +1281,6 @@ function SessionChat({
 
   useEffect(() => {
     setText(readDraft(draftKey));
-    setReferences([]);
   }, [draftKey]);
 
   useEffect(() => {
@@ -1400,10 +1493,7 @@ function SessionChat({
   async function send() {
     if (!text.trim() || locked) return;
     const sent = text;
-    const sentRefs = references.map((ref) => ({
-      target_type: ref.targetType,
-      target_id: ref.targetId,
-    }));
+    const sentRefs = serializeReferences(references);
     await perform(async () => {
       const run = await request(`/sessions/${session.id}/runs`, runSchema, {
         method: "POST",
@@ -1412,11 +1502,19 @@ function SessionChat({
           model_id: modelId === "default" ? null : modelId,
           ...(reasoningEffort === "default" ? {} : { reasoning_effort: reasoningEffort }),
           ...(sentRefs.length > 0 ? { references: sentRefs } : {}),
+          ...(currentFocus
+            ? {
+                current_focus: {
+                  target_type: currentFocus.targetType,
+                  target_id: currentFocus.targetId,
+                },
+              }
+            : {}),
         },
       });
       if (!mounted.current) return;
       updateText("");
-      setReferences([]);
+      onReferencesChange([]);
       setRuns((old) => {
         const next = [run, ...old.filter((item) => item.id !== run.id)];
         onRunsChangeRef.current(next);
@@ -1603,7 +1701,9 @@ function SessionChat({
         }}
         visibilityPermanent
         references={references}
-        onReferencesChange={setReferences}
+        onReferencesChange={onReferencesChange}
+        currentFocus={currentFocus}
+        onDismissFocus={onDismissFocus}
         candidates={candidates}
         running={running}
         waiting={Boolean(waiting)}
@@ -1651,6 +1751,8 @@ type ChatPanelProps = {
   bookId: string;
   chapters?: Chapter[];
   entries?: Entry[];
+  currentFocus?: FocusTarget | null;
+  pendingExcerpt?: { seq: number; item: ExcerptReferenceInput } | null;
   onPending: (id: string) => void;
   expanded?: boolean;
   toolbarStart?: ReactNode;
@@ -1661,6 +1763,8 @@ function BookChat({
   bookId,
   chapters = [],
   entries = [],
+  currentFocus = null,
+  pendingExcerpt = null,
   onPending,
   expanded = false,
   toolbarStart,
@@ -1684,6 +1788,9 @@ function BookChat({
   });
   const [draftVisibility, setDraftVisibility] = useState<Session["visibility_scope"]>("local");
   const [draftRefs, setDraftRefs] = useState<EntityReferenceItem[]>([]);
+  const [refsBySession, setRefsBySession] = useState<Record<string, EntityReferenceItem[]>>({});
+  const [dismissedFocusKey, setDismissedFocusKey] = useState("");
+  const lastExcerptSeq = useRef(0);
   const [runsBySession, setRunsBySession] = useState<Record<string, Run[]>>({});
   const [compactionsBySession, setCompactionsBySession] = useState<Record<string, Compaction[]>>(
     {},
@@ -1793,6 +1900,61 @@ function BookChat({
   const editingSession = sessions.find((session) => session.id === editingId);
   const selectedRuns = selected ? runsBySession[selected.id] : undefined;
   const selectedCompactions = selected ? compactionsBySession[selected.id] : undefined;
+  const selectedRefs = selected ? (refsBySession[selected.id] ?? []) : [];
+
+  const currentFocusKey = currentFocus ? `${currentFocus.targetType}:${currentFocus.targetId}` : "";
+  useEffect(() => {
+    setDismissedFocusKey("");
+  }, [currentFocusKey, sessionId]);
+
+  useEffect(() => {
+    if (!pendingExcerpt || pendingExcerpt.seq <= lastExcerptSeq.current) return;
+    lastExcerptSeq.current = pendingExcerpt.seq;
+    const item = pendingExcerpt.item;
+    const entryItem: EntityReferenceItem = {
+      key: `excerpt:${item.targetType}:${item.targetId}:${pendingExcerpt.seq}`,
+      targetType: item.targetType,
+      targetId: item.targetId,
+      title: item.title,
+      label: item.label,
+      selectedText: item.selectedText,
+      startLine: item.startLine,
+      endLine: item.endLine,
+    };
+    if (selected) {
+      setRefsBySession((old) => ({
+        ...old,
+        [selected.id]: [...(old[selected.id] ?? []), entryItem],
+      }));
+    } else {
+      setDraftRefs((old) => [...old, entryItem]);
+    }
+    focusComposer();
+  }, [pendingExcerpt, selected, focusComposer]);
+
+  function resolveVisibleFocus(
+    scope: Session["visibility_scope"],
+    refs: EntityReferenceItem[],
+  ): FocusTarget | null {
+    if (!currentFocus || currentFocusKey === dismissedFocusKey) return null;
+    if (scope === "local" && currentFocus.visibility === "global") return null;
+    if (
+      refs.some(
+        (ref) =>
+          !ref.selectedText &&
+          ref.targetType === currentFocus.targetType &&
+          ref.targetId === currentFocus.targetId,
+      )
+    ) {
+      return null;
+    }
+    return currentFocus;
+  }
+
+  const activeSessionFocus = selected
+    ? resolveVisibleFocus(selected.visibility_scope, selectedRefs)
+    : null;
+  const draftFocus = !selected ? resolveVisibleFocus(draftVisibility, draftRefs) : null;
 
   const draftCandidates = useMemo(
     () => buildReferenceCandidates(chapters, entries, draftVisibility),
@@ -1872,10 +2034,8 @@ function BookChat({
   async function sendBlankDraft() {
     if (!draftText.trim() || busy) return;
     const sent = draftText;
-    const sentRefs = draftRefs.map((ref) => ({
-      target_type: ref.targetType,
-      target_id: ref.targetId,
-    }));
+    const sentRefs = serializeReferences(draftRefs);
+    const sentFocus = draftFocus;
     setBusy(true);
     setError("");
     let createdSession: Session | null = null;
@@ -1895,6 +2055,14 @@ function BookChat({
           model_id: draftModelId === "default" ? null : draftModelId,
           ...(reasoningEffort === "default" ? {} : { reasoning_effort: reasoningEffort }),
           ...(sentRefs.length > 0 ? { references: sentRefs } : {}),
+          ...(sentFocus
+            ? {
+                current_focus: {
+                  target_type: sentFocus.targetType,
+                  target_id: sentFocus.targetId,
+                },
+              }
+            : {}),
         },
       });
       if (!mounted.current) return;
@@ -2183,6 +2351,12 @@ function BookChat({
             onReasoningEffortChange={updateReasoningEffort}
             chapters={chapters}
             entries={entries}
+            references={selectedRefs}
+            onReferencesChange={(refs) =>
+              setRefsBySession((old) => ({ ...old, [selected.id]: refs }))
+            }
+            currentFocus={activeSessionFocus}
+            onDismissFocus={() => setDismissedFocusKey(currentFocusKey)}
             initialRuns={runsBySession[selected.id]}
             onRunsChange={(records) =>
               setRunsBySession((old) => ({ ...old, [selected.id]: records }))
@@ -2228,6 +2402,8 @@ function BookChat({
               visibilityPermanent={false}
               references={draftRefs}
               onReferencesChange={setDraftRefs}
+              currentFocus={draftFocus}
+              onDismissFocus={() => setDismissedFocusKey(currentFocusKey)}
               candidates={draftCandidates}
               running={false}
               waiting={false}
