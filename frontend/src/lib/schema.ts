@@ -153,16 +153,39 @@ export const providerSchema = z.object({
   headers_configured: z.boolean(),
   enabled: z.boolean(),
 });
+export const paramSourceSchema = z.enum(["user", "server", "catalog", "default"]);
+export const upstreamSourceSchema = z.enum(["server", "catalog"]);
+export const upstreamChangeSchema = z.object({
+  field: z.enum(["protocol", "context_window", "max_output_tokens"]),
+  user_value: z.union([z.string(), z.number()]),
+  upstream_value: z.union([z.string(), z.number()]),
+  upstream_source: upstreamSourceSchema,
+});
 export const modelSchema = z.object({
   id: z.string(),
   provider_id: z.string(),
   model_id: z.string(),
   display_name: z.string(),
   protocol_override: protocolSchema.nullable(),
+  protocol_mode: z.enum(["auto", "inherit", "override"]).optional(),
   context_window: z.number().nullable(),
   max_output_tokens: z.number().nullable(),
   capabilities_json: z.string(),
   enabled: z.boolean(),
+  effective_protocol: protocolSchema.optional(),
+  effective_protocol_override: protocolSchema.nullable().default(null),
+  protocol_source: paramSourceSchema.default("default"),
+  effective_context_window: z.number().nullable().default(null),
+  context_window_source: paramSourceSchema.default("default"),
+  effective_max_output_tokens: z.number().nullable().default(null),
+  max_output_tokens_source: paramSourceSchema.default("default"),
+  upstream_protocol: protocolSchema.nullable().default(null),
+  upstream_protocol_source: upstreamSourceSchema.nullable().default(null),
+  upstream_context_window: z.number().nullable().default(null),
+  upstream_context_window_source: upstreamSourceSchema.nullable().default(null),
+  upstream_max_output_tokens: z.number().nullable().default(null),
+  upstream_max_output_tokens_source: upstreamSourceSchema.nullable().default(null),
+  pending_changes: z.array(upstreamChangeSchema).default([]),
 });
 export const settingsSchema = z.object({
   default_model_id: z.string().nullable(),
@@ -193,6 +216,9 @@ export const discoveredSchema = z.object({
   catalog_match: z.enum(["none", "provider", "cross_provider"]).default("none"),
   catalog_provider: z.string().nullable().default(null),
   catalog_stale: z.boolean().default(false),
+  server_context_window: z.number().nullable().default(null),
+  server_max_output_tokens: z.number().nullable().default(null),
+  server_protocol: protocolSchema.nullable().default(null),
 });
 export const catalogStatusSchema = z.object({
   cached: z.boolean(),

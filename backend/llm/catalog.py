@@ -196,7 +196,7 @@ def _unambiguous_str(values: list[str]) -> str:
     return ""
 
 
-class _CatalogSnapshot:
+class CatalogSnapshot:
     """In-memory indexed view of a single loaded model-catalog.json snapshot."""
 
     def __init__(self, doc: JsonObject, *, now: datetime | None = None) -> None:
@@ -386,11 +386,17 @@ class ModelCatalogCache:
         tmp_path.replace(self.path)
         return self.status()
 
-    def lookup(self, provider_preset: str, model_id: str) -> CatalogEntry | None:
+    def snapshot(self) -> CatalogSnapshot | None:
         doc = self._load()
         if doc is None:
             return None
-        return _CatalogSnapshot(doc).lookup(provider_preset, model_id)
+        return CatalogSnapshot(doc)
+
+    def lookup(self, provider_preset: str, model_id: str) -> CatalogEntry | None:
+        snap = self.snapshot()
+        if snap is None:
+            return None
+        return snap.lookup(provider_preset, model_id)
 
     def enrich_discovered(
         self,
@@ -400,18 +406,32 @@ class ModelCatalogCache:
         """Fill missing metadata from a single loaded cache snapshot without overriding server facts."""
         if not items:
             return items
-        doc = self._load()
-        snapshot = _CatalogSnapshot(doc) if doc is not None else None
+        snapshot = self.snapshot()
         enriched: list[DiscoveredModel] = []
         for item in items:
             if not item.supported:
                 enriched.append(item)
                 continue
+            server_ctx = (
+                item.server_context_window
+                if item.server_context_window is not None
+                else item.context_window
+            )
+            server_out = (
+                item.server_max_output_tokens
+                if item.server_max_output_tokens is not None
+                else item.max_output_tokens
+            )
+            server_proto = (
+                item.server_protocol
+                if item.server_protocol is not None
+                else item.recommended_protocol
+            )
             entry = (
                 snapshot.lookup(provider_preset, item.model_id) if snapshot is not None else None
             )
             # Precedence: server-disclosed protocol > direct-provider catalog > inherit default.
-            resolved_protocol = item.recommended_protocol
+            resolved_protocol = server_proto
             if (
                 resolved_protocol is None
                 and entry is not None
@@ -419,9 +439,15 @@ class ModelCatalogCache:
                 and entry.protocol is not None
             ):
                 resolved_protocol = entry.protocol
-            recommended = resolved_protocol
             if entry is None:
-                enriched.append(item)
+                enriched.append(
+                    replace(
+                        item,
+                        server_context_window=server_ctx,
+                        server_max_output_tokens=server_out,
+                        server_protocol=server_proto,
+                    )
+                )
                 continue
             display_name = item.display_name
             if (not display_name or display_name == item.model_id) and entry.display_name:
@@ -430,16 +456,17 @@ class ModelCatalogCache:
                 replace(
                     item,
                     display_name=display_name,
-                    context_window=item.context_window
-                    if item.context_window is not None
-                    else entry.context_window,
-                    max_output_tokens=item.max_output_tokens
-                    if item.max_output_tokens is not None
-                    else entry.max_output_tokens,
-                    recommended_protocol=recommended,
+                    context_window=server_ctx if server_ctx is not None else entry.context_window,
+                    max_output_tokens=(
+                        server_out if server_out is not None else entry.max_output_tokens
+                    ),
+                    recommended_protocol=resolved_protocol,
                     catalog_match=entry.match_scope,
                     catalog_provider=entry.source_provider,
                     catalog_stale=entry.stale,
+                    server_context_window=server_ctx,
+                    server_max_output_tokens=server_out,
+                    server_protocol=server_proto,
                 )
             )
         return enriched

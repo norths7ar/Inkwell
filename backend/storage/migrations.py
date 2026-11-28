@@ -6,7 +6,7 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 
 _V1_STATEMENTS: tuple[str, ...] = (
     """
@@ -304,6 +304,20 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
         ),
     ),
+    (
+        6,
+        (
+            "ALTER TABLE models ADD COLUMN discovered_json TEXT NOT NULL DEFAULT '{}'",
+            "ALTER TABLE models ADD COLUMN acked_upstream_json TEXT NOT NULL DEFAULT '{}'",
+        ),
+    ),
+    (
+        7,
+        (
+            "ALTER TABLE models ADD COLUMN protocol_mode TEXT NOT NULL DEFAULT 'auto' CHECK (protocol_mode IN ('auto', 'inherit', 'override'))",
+            "UPDATE models SET protocol_mode = 'override' WHERE protocol_override IS NOT NULL",
+        ),
+    ),
 )
 
 
@@ -331,18 +345,25 @@ def current_version(conn: sqlite3.Connection) -> int:
 def migrate(conn: sqlite3.Connection) -> int:
     """Apply pending schema migrations sequentially and return final schema version."""
     version = current_version(conn)
+    original_version = version
     if version > SCHEMA_VERSION:
         raise RuntimeError(
             f"Database schema version {version} is newer than supported version {SCHEMA_VERSION}"
         )
 
-    for target_version, statements in MIGRATIONS:
-        if target_version <= version:
-            continue
-        with ensure_transaction(conn):
+    # Preserve the starting-version semantics across the whole upgrade, including a retry.
+    with ensure_transaction(conn):
+        for target_version, statements in MIGRATIONS:
+            if target_version <= version:
+                continue
             for statement in statements:
                 conn.execute(statement)
+            if target_version == 7 and original_version < 6:
+                # Before automatic parameter resolution, null explicitly inherited the provider.
+                conn.execute(
+                    "UPDATE models SET protocol_mode = 'inherit' WHERE protocol_override IS NULL"
+                )
             conn.execute(f"PRAGMA user_version = {target_version}")
-        version = target_version
+            version = target_version
 
     return version

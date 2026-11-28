@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -15,7 +16,45 @@ from backend.config import AppConfig
 from backend.llm._json import JsonObject
 from backend.llm.catalog import MODELS_DEV_API_URL, ModelCatalogCache
 from backend.llm.client import LLMClient
+from backend.llm.model_params import resolve_model_params
 from backend.llm.types import AuthStyle, DiscoveredModel, EndpointConfig, WireProtocol
+from backend.storage.migrations import MIGRATIONS, migrate
+from backend.storage.models import ProtocolMode, ProtocolName
+from backend.storage.repos import config as model_config
+
+
+@pytest.mark.parametrize(
+    "version, expected_mode", [(5, ProtocolMode.INHERIT), (6, ProtocolMode.AUTO)]
+)
+def test_protocol_selection_migration(version: int, expected_mode: ProtocolMode) -> None:
+    with sqlite3.connect(":memory:", isolation_level=None) as conn:
+        conn.row_factory = sqlite3.Row
+        for target, statements in MIGRATIONS:
+            if target <= version:
+                for statement in statements:
+                    conn.execute(statement)
+        conn.execute(f"PRAGMA user_version = {version}")
+        provider = model_config.create_provider(
+            conn,
+            name="Provider",
+            base_url="https://mock.invalid",
+            default_protocol=ProtocolName.OPENAI_CHAT,
+        )
+        conn.execute(
+            """INSERT INTO models (
+                id, provider_id, model_id, display_name, protocol_override, context_window,
+                created_at, updated_at
+            ) VALUES ('model', ?, 'model', 'Model', NULL, 64000, '', '')""",
+            (provider.id,),
+        )
+        migrate(conn)
+        model = model_config.get_model(conn, "model")
+        assert model is not None
+        assert model.protocol_mode == expected_mode
+        resolved = resolve_model_params(model, provider, None)
+        assert resolved.effective_protocol == ProtocolName.OPENAI_CHAT
+        assert resolved.effective_context_window == 64000
+        assert resolved.context_window_source == "user"
 
 
 def _sample_models_dev() -> JsonObject:
@@ -401,3 +440,209 @@ def test_legacy_catalog_requires_refresh(tmp_path: Path) -> None:
     assert cache.status().stale
     assert cache.lookup("deepseek", "deepseek-chat") is None
     assert path.is_file()  # Leave the old file untouched until a successful refresh.
+
+
+def test_three_layer_auto_refresh_and_user_override_prompt_lifecycle(tmp_path: Path) -> None:
+    catalog_ctx = 200000
+    catalog_out = 64000
+    server_ctx = 512000
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == MODELS_DEV_API_URL:
+            return httpx.Response(
+                200,
+                json={
+                    "opencode": {
+                        "npm": "@ai-sdk/openai-compatible",
+                        "models": {
+                            "claude-sonnet-4-5": {
+                                "id": "claude-sonnet-4-5",
+                                "name": "Claude Sonnet 4.5",
+                                "limit": {"context": catalog_ctx, "output": catalog_out},
+                                "provider": {"npm": "@ai-sdk/anthropic"},
+                            },
+                            "gpt-5": {
+                                "id": "gpt-5",
+                                "name": "GPT-5",
+                                "limit": {"context": 400000, "output": 128000},
+                                "provider": {"npm": "@ai-sdk/openai"},
+                            },
+                        },
+                    }
+                },
+            )
+        if request.url.path.endswith("/models"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"id": "claude-sonnet-4-5"},
+                        {"id": "gpt-5", "context_window": server_ctx, "protocol": "openai-chat"},
+                    ]
+                },
+            )
+        return httpx.Response(404)
+
+    config = AppConfig(data_dir=tmp_path, host="127.0.0.1", port=0)
+    app = create_app(config=config, llm=LLMClient(transport=httpx.MockTransport(handler)))
+
+    with TestClient(app) as client:
+        assert client.post("/api/model-catalog/refresh").status_code == 200
+        provider_id = client.post(
+            "/api/providers",
+            json={
+                "name": "OpenCode Zen",
+                "preset": "opencode-zen",
+                "base_url": "https://opencode.ai/zen/v1",
+                "default_protocol": "openai-chat",
+                "api_key": "sk-test",
+            },
+        ).json()["id"]
+
+        # Import catalog-backed model with no user overrides -> follows catalog automatically.
+        claude_id = client.post(
+            f"/api/providers/{provider_id}/models",
+            json={"model_id": "claude-sonnet-4-5"},
+        ).json()["id"]
+        claude = client.get(f"/api/models/{claude_id}").json()
+        assert claude["context_window"] is None
+        assert claude["effective_context_window"] == 200000
+        assert claude["context_window_source"] == "catalog"
+        assert claude["effective_protocol"] == "anthropic-messages"
+        assert claude["pending_changes"] == []
+
+        inherited = client.patch(
+            f"/api/models/{claude_id}",
+            json={"protocol_mode": "inherit", "protocol_override": None},
+        ).json()
+        assert inherited["protocol_mode"] == "inherit"
+        assert inherited["effective_protocol"] == "openai-chat"
+        client.patch(f"/api/providers/{provider_id}", json={"default_protocol": "openai-responses"})
+        inherited = client.get(f"/api/models/{claude_id}").json()
+        assert inherited["effective_protocol"] == "openai-responses"
+        automatic = client.patch(f"/api/models/{claude_id}", json={"protocol_mode": "auto"}).json()
+        assert automatic["effective_protocol"] == "anthropic-messages"
+        assert automatic["protocol_source"] == "catalog"
+
+        custom_provider = client.post(
+            "/api/providers",
+            json={"name": "Gateway", "preset": "custom", "base_url": "https://mock.invalid/v1"},
+        ).json()["id"]
+        imported = client.post(
+            f"/api/providers/{custom_provider}/models",
+            json={"model_id": "claude-sonnet-4-5", "protocol_mode": "auto"},
+        ).json()
+        assert imported["effective_context_window"] == 200000
+        assert imported["effective_max_output_tokens"] == 64000
+        assert imported["context_window_source"] == "catalog"
+        assert imported["effective_protocol"] == "openai-chat"
+
+        # Catalog refresh automatically updates non-overridden fields.
+        catalog_ctx = 400000
+        catalog_out = 128000
+        assert client.post("/api/model-catalog/refresh").status_code == 200
+        claude = client.get(f"/api/models/{claude_id}").json()
+        assert claude["effective_context_window"] == 400000
+        assert claude["effective_max_output_tokens"] == 128000
+        assert claude["pending_changes"] == []
+
+        # Import server-disclosed model -> server facts beat catalog and auto-refresh on discover.
+        gpt_id = client.post(
+            f"/api/providers/{provider_id}/models",
+            json={
+                "model_id": "gpt-5",
+                "discovered_context_window": 512000,
+                "discovered_protocol": "openai-chat",
+            },
+        ).json()["id"]
+        gpt = client.get(f"/api/models/{gpt_id}").json()
+        assert gpt["effective_context_window"] == 512000
+        assert gpt["context_window_source"] == "server"
+        assert gpt["effective_protocol"] == "openai-chat"
+        assert gpt["protocol_source"] == "server"
+
+        server_ctx = 1000000
+        assert client.post(f"/api/providers/{provider_id}/discover").status_code == 200
+        gpt = client.get(f"/api/models/{gpt_id}").json()
+        assert gpt["effective_context_window"] == 1000000
+        assert gpt["context_window_source"] == "server"
+        assert gpt["pending_changes"] == []
+
+        # User manually overrides context_window -> current upstream (400000) is acked, no prompt.
+        patched = client.patch(
+            f"/api/models/{claude_id}",
+            json={"context_window": 100000},
+        ).json()
+        assert patched["effective_context_window"] == 100000
+        assert patched["context_window_source"] == "user"
+        assert patched["pending_changes"] == []
+
+        # Upstream changes to 500000 -> user override preserved, single pending change surfaced.
+        catalog_ctx = 500000
+        assert client.post("/api/model-catalog/refresh").status_code == 200
+        claude = client.get(f"/api/models/{claude_id}").json()
+        assert claude["effective_context_window"] == 100000
+        assert claude["pending_changes"] == [
+            {
+                "field": "context_window",
+                "user_value": 100000,
+                "upstream_value": 500000,
+                "upstream_source": "catalog",
+            }
+        ]
+
+        # User chooses "keep" -> prompt dismissed until upstream changes again.
+        renamed = client.patch(
+            f"/api/models/{claude_id}", json={"display_name": "Writing model"}
+        ).json()
+        assert renamed["display_name"] == "Writing model"
+        assert renamed["pending_changes"] == claude["pending_changes"]
+        kept = client.post(
+            f"/api/models/{claude_id}/resolve-change",
+            json={
+                "field": "context_window",
+                "action": "keep",
+                "expected_user_value": 100000,
+                "expected_upstream_value": 500000,
+                "expected_upstream_source": "catalog",
+            },
+        ).json()
+        assert kept["effective_context_window"] == 100000
+        assert kept["pending_changes"] == []
+        assert client.get(f"/api/models/{claude_id}").json()["pending_changes"] == []
+
+        # Upstream changes again to 1000000 -> prompts again; user chooses "accept" -> follows catalog.
+        catalog_ctx = 1000000
+        assert client.post("/api/model-catalog/refresh").status_code == 200
+        claude = client.get(f"/api/models/{claude_id}").json()
+        assert len(claude["pending_changes"]) == 1
+        assert claude["pending_changes"][0]["upstream_value"] == 1000000
+
+        stale = client.post(
+            f"/api/models/{claude_id}/resolve-change",
+            json={
+                "field": "context_window",
+                "action": "keep",
+                "expected_user_value": 100000,
+                "expected_upstream_value": 500000,
+                "expected_upstream_source": "catalog",
+            },
+        )
+        assert stale.status_code == 409
+        current = client.get(f"/api/models/{claude_id}").json()
+        assert current["pending_changes"] == claude["pending_changes"]
+
+        accepted = client.post(
+            f"/api/models/{claude_id}/resolve-change",
+            json={
+                "field": "context_window",
+                "action": "accept",
+                "expected_user_value": 100000,
+                "expected_upstream_value": 1000000,
+                "expected_upstream_source": "catalog",
+            },
+        ).json()
+        assert accepted["context_window"] is None
+        assert accepted["effective_context_window"] == 1000000
+        assert accepted["context_window_source"] == "catalog"
+        assert accepted["pending_changes"] == []

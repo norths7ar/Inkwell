@@ -59,6 +59,12 @@ class RevisionSource(StrEnum):
     RESTORE = "restore"
 
 
+class ProtocolMode(StrEnum):
+    AUTO = "auto"
+    INHERIT = "inherit"
+    OVERRIDE = "override"
+
+
 class ProtocolName(StrEnum):
     OPENAI_CHAT = "openai-chat"
     OPENAI_RESPONSES = "openai-responses"
@@ -288,6 +294,9 @@ class ModelRecord:
     enabled: bool
     created_at: str
     updated_at: str
+    discovered_json: str = "{}"
+    acked_upstream_json: str = "{}"
+    protocol_mode: ProtocolMode = ProtocolMode.INHERIT
 
 
 @dataclass(frozen=True, slots=True)

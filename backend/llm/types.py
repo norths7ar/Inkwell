@@ -183,3 +183,6 @@ class DiscoveredModel:
     catalog_match: str = "none"
     catalog_provider: str | None = None
     catalog_stale: bool = False
+    server_context_window: int | None = None
+    server_max_output_tokens: int | None = None
+    server_protocol: WireProtocol | None = None

@@ -3,7 +3,7 @@
 import asyncio
 import json
 import sqlite3
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 
 from fastapi import HTTPException
 from pydantic import JsonValue, TypeAdapter
@@ -22,7 +22,9 @@ from backend.config import AppConfig
 from backend.crypto import create_cipher
 from backend.errors import exception_error
 from backend.llm._json import JsonObject
+from backend.llm.catalog import ModelCatalogCache
 from backend.llm.client import LLMClient
+from backend.llm.model_params import resolve_model_params
 from backend.llm.presets import build_endpoint_from_preset
 from backend.llm.types import (
     EndpointConfig,
@@ -120,6 +122,16 @@ class ApiRuntime:
         ):
             raise HTTPException(409, "Session already has an active or waiting run")
 
+    def _effective_model(self, model: ModelRecord, provider: Provider) -> ModelRecord:
+        catalog = ModelCatalogCache(self.config.catalog_path).snapshot()
+        resolved = resolve_model_params(model, provider, catalog)
+        return replace(
+            model,
+            protocol_override=resolved.effective_protocol_override,
+            context_window=resolved.effective_context_window,
+            max_output_tokens=resolved.effective_max_output_tokens,
+        )
+
     def resolve_model(self, record_id: str | None) -> tuple[ModelRecord, EndpointConfig]:
         record_id = record_id or config.get_setting(self.conn, "default_model_id")
         model = config.get_model(self.conn, record_id) if record_id else None
@@ -128,7 +140,7 @@ class ApiRuntime:
         provider = config.get_provider(self.conn, model.provider_id)
         if provider is None or not provider.enabled:
             raise HTTPException(422, "Model provider is disabled or missing")
-        return model, self.endpoint(provider)
+        return self._effective_model(model, provider), self.endpoint(provider)
 
     def _fallback_session_title(self, text: str) -> str:
         for raw_line in text.splitlines():
@@ -148,7 +160,7 @@ class ApiRuntime:
             provider = config.get_provider(self.conn, model.provider_id)
             if provider is None or not provider.enabled:
                 continue
-            return model, self.endpoint(provider)
+            return self._effective_model(model, provider), self.endpoint(provider)
         return None
 
     async def _generate_session_title(

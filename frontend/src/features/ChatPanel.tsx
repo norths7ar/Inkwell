@@ -2143,7 +2143,8 @@ function BookChat({
     const latestModel = latestWithTokens?.model_id
       ? models.find((item) => item.id === latestWithTokens.model_id)
       : models.find((item) => item.id === defaultModelId);
-    const contextLimit = latestModel?.context_window ?? null;
+    const contextLimit =
+      latestModel?.effective_context_window ?? latestModel?.context_window ?? null;
     const latestInput = latestWithTokens?.input_tokens ?? 0;
     if (totals.input > 0 || totals.output > 0 || (selectedCompactions?.length ?? 0) > 0) {
       const ratio = contextLimit && contextLimit > 0 ? latestInput / contextLimit : null;

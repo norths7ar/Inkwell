@@ -33,7 +33,7 @@ import {
   Switch,
   Textarea,
 } from "../components/ui";
-import { errorText, remove, request, upload } from "../lib/api";
+import { ApiError, errorText, remove, request, upload } from "../lib/api";
 import {
   DEFAULT_EDITOR_PREFS,
   loadEditorPrefs,
@@ -56,6 +56,7 @@ import {
   type BackupRecord,
   type Book,
   type CatalogStatus,
+  type CatalogLookup,
   type Model,
   type Provider,
   type SystemStatus,
@@ -206,6 +207,16 @@ function SettingsContent({
     onSaved();
   }
 
+  async function reloadModels() {
+    try {
+      const next = await request("/models", modelSchema.array());
+      setModels(next);
+      onSaved();
+    } catch {
+      /* Ignore transient refresh failures; user actions surface their own errors. */
+    }
+  }
+
   async function deleteProvider() {
     if (!deletingProvider) return;
     setBusy(true);
@@ -339,6 +350,7 @@ function SettingsContent({
                     onSaved();
                   }}
                   onModelSaved={modelSaved}
+                  onReloadModels={reloadModels}
                   onModelDeleted={(id) => {
                     setModels((items) => items.filter((item) => item.id !== id));
                     onSaved();
@@ -800,6 +812,25 @@ function formatCompactTokens(value: number): string {
   return String(value);
 }
 
+function formatUpstreamSource(source: "server" | "catalog" | null): string {
+  if (source === "server") return "服务端";
+  if (source === "catalog") return "目录";
+  return "上游";
+}
+
+function formatParamField(field: "protocol" | "context_window" | "max_output_tokens"): string {
+  if (field === "protocol") return "协议";
+  if (field === "context_window") return "上下文窗口";
+  return "最大输出";
+}
+
+function formatParamValue(
+  field: "protocol" | "context_window" | "max_output_tokens",
+  value: string | number,
+): string {
+  return field === "protocol" ? String(value) : Number(value).toLocaleString();
+}
+
 function ModelsSection({
   providers,
   models,
@@ -807,6 +838,7 @@ function ModelsSection({
   settings,
   onSettingsSaved,
   onModelSaved,
+  onReloadModels,
   onModelDeleted,
 }: {
   providers: Provider[];
@@ -815,6 +847,7 @@ function ModelsSection({
   settings: GlobalSettings | null;
   onSettingsSaved: (settings: GlobalSettings) => void;
   onModelSaved: (model: Model) => void;
+  onReloadModels: () => Promise<void>;
   onModelDeleted: (id: string) => void;
 }) {
   const [catalogStatus, setCatalogStatus] = useState<CatalogStatus | null>(null);
@@ -843,6 +876,7 @@ function ModelsSection({
         method: "POST",
       });
       setCatalogStatus(next);
+      await onReloadModels();
       return next;
     } catch (failure) {
       setCatalogError(errorText(failure));
@@ -900,6 +934,7 @@ function ModelsSection({
                 catalogStatus={catalogStatus}
                 catalogBusy={catalogBusy}
                 onRefreshCatalog={refreshCatalog}
+                onReloadModels={onReloadModels}
                 onSaved={onModelSaved}
                 onDeleted={onModelDeleted}
               />
@@ -1007,6 +1042,7 @@ function ProviderModelsBlock({
   catalogStatus,
   catalogBusy,
   onRefreshCatalog,
+  onReloadModels,
   onSaved,
   onDeleted,
 }: {
@@ -1015,6 +1051,7 @@ function ProviderModelsBlock({
   catalogStatus: CatalogStatus | null;
   catalogBusy: boolean;
   onRefreshCatalog: () => Promise<CatalogStatus | null>;
+  onReloadModels: () => Promise<void>;
   onSaved: (model: Model) => void;
   onDeleted: (id: string) => void;
 }) {
@@ -1036,6 +1073,7 @@ function ProviderModelsBlock({
       setDiscovered(list);
       setDiscoverFilter("");
       setSelected([]);
+      await onReloadModels();
     } catch (failure) {
       setError(errorText(failure));
     } finally {
@@ -1060,9 +1098,13 @@ function ProviderModelsBlock({
           body: {
             model_id: model.model_id,
             display_name: model.display_name,
-            protocol_override: model.recommended_protocol,
-            context_window: model.context_window,
-            max_output_tokens: model.max_output_tokens,
+            protocol_override: null,
+            protocol_mode: "auto",
+            context_window: null,
+            max_output_tokens: null,
+            discovered_protocol: model.server_protocol,
+            discovered_context_window: model.server_context_window,
+            discovered_max_output_tokens: model.server_max_output_tokens,
           },
         });
         onSaved(saved);
@@ -1076,19 +1118,40 @@ function ProviderModelsBlock({
     }
   }
 
+  async function resolveChange(
+    model: Model,
+    change: Model["pending_changes"][number],
+    action: "accept" | "keep",
+  ) {
+    setBusy(true);
+    setError("");
+    try {
+      const saved = await request(`/models/${model.id}/resolve-change`, modelSchema, {
+        method: "POST",
+        body: {
+          field: change.field,
+          action,
+          expected_upstream_value: change.upstream_value,
+          expected_upstream_source: change.upstream_source,
+          expected_user_value: change.user_value,
+        },
+      });
+      onSaved(saved);
+    } catch (failure) {
+      setError(errorText(failure));
+      if (failure instanceof ApiError && failure.status === 409) await onReloadModels();
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function toggleModelEnabled(model: Model, nextEnabled: boolean) {
     setBusy(true);
     setError("");
     try {
       const saved = await request(`/models/${model.id}`, modelSchema, {
         method: "PATCH",
-        body: {
-          display_name: model.display_name,
-          protocol_override: model.protocol_override,
-          context_window: model.context_window,
-          max_output_tokens: model.max_output_tokens,
-          enabled: nextEnabled,
-        },
+        body: { enabled: nextEnabled },
       });
       onSaved(saved);
     } catch (failure) {
@@ -1152,46 +1215,82 @@ function ProviderModelsBlock({
         <p className="muted">尚未导入模型，点击右上角「发现模型」或「手动添加」。</p>
       ) : (
         <div className="flat-list">
-          {models.map((model) => (
-            <div className="flat-list-row" key={model.id}>
-              <div className="flat-list-main">
-                <div className="row">
-                  <strong>{model.display_name || model.model_id}</strong>
-                  {model.protocol_override && <Badge>{model.protocol_override}</Badge>}
+          {models.map((model) => {
+            const shownProtocol = model.effective_protocol_override ?? model.protocol_override;
+            const shownContext = model.effective_context_window ?? model.context_window;
+            return (
+              <div className="flat-list-group" key={model.id}>
+                <div className="flat-list-row">
+                  <div className="flat-list-main">
+                    <div className="row">
+                      <strong>{model.display_name || model.model_id}</strong>
+                      {shownProtocol && <Badge>{shownProtocol}</Badge>}
+                    </div>
+                    <span className="muted">
+                      {model.model_id}
+                      {shownContext ? ` · ${shownContext.toLocaleString()} ctx` : ""}
+                    </span>
+                  </div>
+                  <div className="row">
+                    <Switch
+                      checked={model.enabled}
+                      disabled={busy}
+                      label={`${model.enabled ? "停用" : "启用"} ${model.display_name || model.model_id}`}
+                      onCheckedChange={(checked) => void toggleModelEnabled(model, checked)}
+                    />
+                    <Button
+                      variant="ghost"
+                      className="icon-control"
+                      title="编辑模型"
+                      aria-label={`编辑模型 ${model.model_id}`}
+                      onClick={() => setEditing(model)}
+                    >
+                      <Pencil size={14} />
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      className="icon-control"
+                      title="删除模型"
+                      aria-label={`删除模型 ${model.model_id}`}
+                      onClick={() => setDeleting(model)}
+                    >
+                      <Trash2 size={14} />
+                    </Button>
+                  </div>
                 </div>
-                <span className="muted">
-                  {model.model_id}
-                  {model.context_window ? ` · ${model.context_window.toLocaleString()} ctx` : ""}
-                </span>
+                {model.pending_changes.length > 0 && (
+                  <div className="model-upstream-changes">
+                    {model.pending_changes.map((change) => (
+                      <div className="model-upstream-change-row" key={change.field}>
+                        <span>
+                          {formatParamField(change.field)}：
+                          {formatUpstreamSource(change.upstream_source)}
+                          已更新为 {formatParamValue(change.field, change.upstream_value)}
+                          （当前手填 {formatParamValue(change.field, change.user_value)}）
+                        </span>
+                        <div className="row">
+                          <Button
+                            variant="ghost"
+                            disabled={busy}
+                            onClick={() => void resolveChange(model, change, "accept")}
+                          >
+                            采用最新
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            disabled={busy}
+                            onClick={() => void resolveChange(model, change, "keep")}
+                          >
+                            保留当前
+                          </Button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
-              <div className="row">
-                <Switch
-                  checked={model.enabled}
-                  disabled={busy}
-                  label={`${model.enabled ? "停用" : "启用"} ${model.display_name || model.model_id}`}
-                  onCheckedChange={(checked) => void toggleModelEnabled(model, checked)}
-                />
-                <Button
-                  variant="ghost"
-                  className="icon-control"
-                  title="编辑模型"
-                  aria-label={`编辑模型 ${model.model_id}`}
-                  onClick={() => setEditing(model)}
-                >
-                  <Pencil size={14} />
-                </Button>
-                <Button
-                  variant="ghost"
-                  className="icon-control"
-                  title="删除模型"
-                  aria-label={`删除模型 ${model.model_id}`}
-                  onClick={() => setDeleting(model)}
-                >
-                  <Trash2 size={14} />
-                </Button>
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
 
@@ -1387,11 +1486,15 @@ function ModelEditor({
 }) {
   const [modelId, setModelId] = useState(initial?.model_id ?? "");
   const [displayName, setDisplayName] = useState(initial?.display_name ?? "");
-  const [protocol, setProtocol] = useState(initial?.protocol_override ?? "inherit");
-  const protocolChosen = useRef(initial !== undefined);
+  const initialProtocol =
+    initial?.protocol_mode === "auto"
+      ? "auto"
+      : (initial?.protocol_override ?? (initial ? "inherit" : "auto"));
+  const [protocol, setProtocol] = useState(initialProtocol);
   const modelIdRef = useRef(initial?.model_id ?? "");
   const [context, setContext] = useState(initial?.context_window?.toString() ?? "");
   const [output, setOutput] = useState(initial?.max_output_tokens?.toString() ?? "");
+  const [catalogSuggestion, setCatalogSuggestion] = useState<CatalogLookup | null>(null);
   const [enabled, setEnabled] = useState(initial?.enabled ?? true);
   const [busy, setBusy] = useState(false);
   const [lookupBusy, setLookupBusy] = useState(false);
@@ -1419,13 +1522,7 @@ function ModelEditor({
       }
       if (result.display_name)
         setDisplayName((current) => (current.trim() ? current : result.display_name));
-      if (result.context_window)
-        setContext((current) => (current.trim() ? current : String(result.context_window)));
-      if (result.max_output_tokens)
-        setOutput((current) => (current.trim() ? current : String(result.max_output_tokens)));
-      if (!protocolChosen.current && result.recommended_protocol) {
-        setProtocol(result.recommended_protocol);
-      }
+      setCatalogSuggestion(result);
       const sourceLabel =
         result.match_scope === "cross_provider"
           ? `（跨提供商参考：${result.source_provider ?? "目录"}，未覆盖协议）`
@@ -1433,7 +1530,7 @@ function ModelEditor({
             ? `（来源：${result.source_provider}）`
             : "";
       setLookupNote(
-        `已从本地缓存补全空缺字段${sourceLabel}${result.stale ? "，缓存已过期建议更新" : ""}。`,
+        `已读取缓存参数，留空的数字与自动协议随来源更新${sourceLabel}${result.stale ? "，缓存已过期建议更新" : ""}。`,
       );
     } catch (failure) {
       setLookupNote(errorText(failure));
@@ -1455,9 +1552,22 @@ function ModelEditor({
           body: {
             ...(initial ? {} : { model_id: modelId.trim() }),
             display_name: displayName.trim() || modelId.trim(),
-            protocol_override: protocol === "inherit" ? null : protocolSchema.parse(protocol),
-            context_window: optionalPositive(context),
-            max_output_tokens: optionalPositive(output),
+            ...(!initial || protocol !== initialProtocol
+              ? {
+                  protocol_mode:
+                    protocol === "auto" || protocol === "inherit" ? protocol : "override",
+                  protocol_override:
+                    protocol === "auto" || protocol === "inherit"
+                      ? null
+                      : protocolSchema.parse(protocol),
+                }
+              : {}),
+            ...(!initial || optionalPositive(context) !== initial.context_window
+              ? { context_window: optionalPositive(context) }
+              : {}),
+            ...(!initial || optionalPositive(output) !== initial.max_output_tokens
+              ? { max_output_tokens: optionalPositive(output) }
+              : {}),
             enabled,
           },
         },
@@ -1466,7 +1576,7 @@ function ModelEditor({
     } catch (failure) {
       setError(
         failure instanceof z.ZodError
-          ? "上下文与输出上限应为正整数，或留空继承默认值。"
+          ? "上下文与输出上限应为正整数，或留空自动采用来源值。"
           : errorText(failure),
       );
     } finally {
@@ -1484,7 +1594,7 @@ function ModelEditor({
             disabled={!!initial}
             onChange={(event) => {
               modelIdRef.current = event.target.value;
-              if (!protocolChosen.current) setProtocol("inherit");
+              setCatalogSuggestion(null);
               setModelId(event.target.value);
               setLookupNote("");
             }}
@@ -1509,10 +1619,19 @@ function ModelEditor({
           label="单模型协议覆盖"
           value={protocol}
           onChange={(value) => {
-            protocolChosen.current = true;
             setProtocol(value);
           }}
-          options={[{ value: "inherit", label: "继承提供商默认协议" }, ...protocols]}
+          options={[
+            {
+              value: "auto",
+              label:
+                initial?.upstream_protocol || catalogSuggestion?.recommended_protocol
+                  ? `自动（${initial?.upstream_protocol ?? catalogSuggestion?.recommended_protocol}）`
+                  : "自动选择协议",
+            },
+            { value: "inherit", label: "继承提供商默认协议" },
+            ...protocols,
+          ]}
         />
         <div className="settings-grid-2">
           <Input
@@ -1520,6 +1639,11 @@ function ModelEditor({
             type="number"
             min={1}
             step={1}
+            placeholder={
+              initial?.upstream_context_window || catalogSuggestion?.context_window
+                ? `自动：${initial?.upstream_context_window ?? catalogSuggestion?.context_window}`
+                : "自动"
+            }
             value={context}
             onChange={(event) => setContext(event.target.value)}
           />
@@ -1528,6 +1652,11 @@ function ModelEditor({
             type="number"
             min={1}
             step={1}
+            placeholder={
+              initial?.upstream_max_output_tokens || catalogSuggestion?.max_output_tokens
+                ? `自动：${initial?.upstream_max_output_tokens ?? catalogSuggestion?.max_output_tokens}`
+                : "自动"
+            }
             value={output}
             onChange={(event) => setOutput(event.target.value)}
           />

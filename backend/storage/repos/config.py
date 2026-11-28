@@ -6,7 +6,7 @@ import sqlite3
 
 from backend.storage.ids import new_id, utc_now
 from backend.storage.migrations import ensure_transaction
-from backend.storage.models import ModelRecord, ProtocolName, Provider
+from backend.storage.models import ModelRecord, ProtocolMode, ProtocolName, Provider
 from backend.storage.repos.content import UNSET, Unset
 
 
@@ -42,6 +42,9 @@ def _model_from_row(row: sqlite3.Row) -> ModelRecord:
         enabled=bool(int(row["enabled"])),
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
+        discovered_json=str(row["discovered_json"]),
+        acked_upstream_json=str(row["acked_upstream_json"]),
+        protocol_mode=ProtocolMode(str(row["protocol_mode"])),
     )
 
 
@@ -173,23 +176,39 @@ def upsert_model(
     capabilities_json: str = "{}",
     enabled: bool = True,
     record_id: str | None = None,
+    discovered_json: str | Unset = UNSET,
+    acked_upstream_json: str | Unset = UNSET,
+    protocol_mode: ProtocolMode | None = None,
 ) -> ModelRecord:
     now = utc_now()
     existing_row = conn.execute(
-        "SELECT id FROM models WHERE provider_id = ? AND model_id = ?",
+        "SELECT id, discovered_json, acked_upstream_json FROM models WHERE provider_id = ? AND model_id = ?",
         (provider_id, model_id),
     ).fetchone()
     resolved_id = str(existing_row["id"]) if existing_row is not None else (record_id or new_id())
+    resolved_discovered = (
+        (str(existing_row["discovered_json"]) if existing_row is not None else "{}")
+        if isinstance(discovered_json, Unset)
+        else discovered_json
+    )
+    resolved_acked = (
+        (str(existing_row["acked_upstream_json"]) if existing_row is not None else "{}")
+        if isinstance(acked_upstream_json, Unset)
+        else acked_upstream_json
+    )
     override_val = protocol_override.value if protocol_override is not None else None
+    resolved_mode = protocol_mode or (
+        ProtocolMode.OVERRIDE if protocol_override is not None else ProtocolMode.INHERIT
+    )
     with ensure_transaction(conn):
         conn.execute(
             """
             INSERT INTO models (
                 id, provider_id, model_id, display_name, protocol_override,
                 context_window, max_output_tokens, capabilities_json, enabled,
-                created_at, updated_at
+                discovered_json, acked_upstream_json, protocol_mode, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (provider_id, model_id) DO UPDATE SET
                 display_name = excluded.display_name,
                 protocol_override = excluded.protocol_override,
@@ -197,6 +216,9 @@ def upsert_model(
                 max_output_tokens = excluded.max_output_tokens,
                 capabilities_json = excluded.capabilities_json,
                 enabled = excluded.enabled,
+                discovered_json = excluded.discovered_json,
+                acked_upstream_json = excluded.acked_upstream_json,
+                protocol_mode = excluded.protocol_mode,
                 updated_at = excluded.updated_at
             """,
             (
@@ -209,6 +231,9 @@ def upsert_model(
                 max_output_tokens,
                 capabilities_json,
                 int(enabled),
+                resolved_discovered,
+                resolved_acked,
+                resolved_mode.value,
                 now,
                 now,
             ),
@@ -217,6 +242,42 @@ def upsert_model(
     if model is None:
         raise RuntimeError(f"Failed to load upserted model {resolved_id}")
     return model
+
+
+def update_model_snapshots(
+    conn: sqlite3.Connection,
+    record_id: str,
+    *,
+    discovered_json: str | Unset = UNSET,
+    acked_upstream_json: str | Unset = UNSET,
+) -> ModelRecord:
+    existing = get_model(conn, record_id)
+    if existing is None:
+        raise LookupError(f"Model not found: {record_id}")
+    next_discovered = (
+        existing.discovered_json if isinstance(discovered_json, Unset) else discovered_json
+    )
+    next_acked = (
+        existing.acked_upstream_json
+        if isinstance(acked_upstream_json, Unset)
+        else acked_upstream_json
+    )
+    if next_discovered == existing.discovered_json and next_acked == existing.acked_upstream_json:
+        return existing
+    now = utc_now()
+    with ensure_transaction(conn):
+        conn.execute(
+            """
+            UPDATE models
+            SET discovered_json = ?, acked_upstream_json = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (next_discovered, next_acked, now, record_id),
+        )
+    updated = get_model(conn, record_id)
+    if updated is None:
+        raise LookupError(f"Model not found after snapshot update: {record_id}")
+    return updated
 
 
 def get_model(conn: sqlite3.Connection, record_id: str) -> ModelRecord | None:
