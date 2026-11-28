@@ -13,7 +13,7 @@
 ### 技术栈
 
 - **后端**：Python `3.14` + `uv` + FastAPI + 标准库 `sqlite3`（WAL 模式 + `PRAGMA user_version` + FTS5）+ 自建 `httpx` 协议优先模型层 + 纯 Python `async` Agent Loop
-- **前端**：Node.js `26` + `pnpm` + TypeScript + React + REST + 原生 `EventSource`（SSE）
+- **前端**：在全局默认栈之外自选 `@radix-ui/react-*` 无样式原语 + `Tailwind CSS`（写作工作台需要高度定制多栏与编辑器布局，成品组件套件受限，用无样式原语管交互、Tailwind 控视觉）、`lucide-react`（统一图标）、`zod`（接口与表单运行时校验）与 `diff`（行内改稿对比）；数据流以本地草稿和单条全局原生 `EventSource`（SSE）为主，未引入 `TanStack Query` 或独立路由库。
 - **本机服务**：独立 `service/` 生命周期 CLI 与 `/health` 探针
 
 ## 2. 模型接入层（协议优先）
